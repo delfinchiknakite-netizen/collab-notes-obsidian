@@ -280,6 +280,13 @@ export default class CollabNotesPlugin extends Plugin {
   async loadSettings() {
     this.settings = Object.assign({}, DEFAULTS, await this.loadData());
     if (!this.settings.shared) this.settings.shared = {};
+    // авто-миграция старых адресов: динамика (POST/WS) должна идти на rt.av-tarasov.ru,
+    // а не на CDN collab.av-tarasov.ru (CDN не проксирует POST → 405) и не на старый sslip.
+    const legacy = ['https://collab.av-tarasov.ru', 'http://collab.av-tarasov.ru', 'http://81-26-189-254.sslip.io', 'https://81-26-189-254.sslip.io'];
+    if (legacy.includes((this.settings.serviceUrl || '').replace(/\/$/, ''))) {
+      this.settings.serviceUrl = 'https://rt.av-tarasov.ru';
+      await this.saveSettings();
+    }
   }
   async saveSettings() { await this.saveData(this.settings); }
 }
