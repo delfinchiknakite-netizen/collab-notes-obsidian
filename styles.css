@@ -1,0 +1,16 @@
+/* курсоры и выделения участников (y-codemirror.next) */
+.cm-ySelectionInfo {
+  position: absolute;
+  top: -1.2em;
+  left: -1px;
+  font-size: 11px;
+  font-family: -apple-system, system-ui, sans-serif;
+  padding: 1px 6px;
+  border-radius: 4px 4px 4px 0;
+  color: #fff;
+  white-space: nowrap;
+  opacity: .9;
+  user-select: none;
+  z-index: 10;
+}
+.cm-ySelectionCaret { position: relative; border-left: 2px solid; margin-left: -1px; }
