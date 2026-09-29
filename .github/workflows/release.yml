@@ -7,6 +7,8 @@ on:
 
 permissions:
   contents: write
+  id-token: write
+  attestations: write
 
 jobs:
   build:
@@ -20,11 +22,15 @@ jobs:
         run: npm ci
       - name: Build
         run: npm run build
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: "main.js"
       - name: Publish release assets
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.ref_name }}
         run: |
           gh release create "$TAG" main.js manifest.json styles.css \
-            --title "$TAG" --notes "Collab Notes $TAG — установка через BRAT." \
+            --title "$TAG" --notes "Collab Notes $TAG" \
           || gh release upload "$TAG" main.js manifest.json styles.css --clobber

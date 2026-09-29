@@ -1,62 +1,72 @@
-# Collab Notes — совместное редактирование заметок в Obsidian
+# Collab Notes
 
-Плагин Obsidian для **совместного редактирования markdown-заметок в реальном времени** с живыми курсорами участников (как в Google Docs). Подключается к self-hosted collab-сервису на Yjs + CodeMirror 6. Работает **на десктопе и на телефоне**.
+Real-time collaborative markdown editing in Obsidian with **live participant cursors** — like Google Docs, but for your notes. Powered by a CRDT (Yjs) over a self-hosted service, so two or more people can edit the same note simultaneously and see each other's carets and selections.
 
-> Сервис по умолчанию: `https://rt.av-tarasov.ru` (динамика) + `https://collab.av-tarasov.ru` (браузерный клиент/ссылки).
+Works on **desktop and mobile**.
 
-## Возможности
+---
 
-- **Реальное время + курсоры** участников с именами.
-- **ПКМ по заметке** (и меню «•••») → «Совместное редактирование» → ссылка + QR для партнёра.
-- **ПКМ по папке** → «Создать совместную заметку из ссылки» (как «Новая доска Kanban»).
-- Партнёр открывает ссылку в браузере **или** добавляет заметку в свой Obsidian этим же плагином.
-- Сессии **переживают перезапуск** (список общих заметок, автопереподключение, отвязка).
-- Доступ к общей заметке **только по подписанной ссылке**.
+## Features
 
-## Установка через BRAT (бета)
+- **Real-time editing + cursors** — see other participants' carets and selections with their names.
+- **Right-click a note** (or the “•••” menu) → **Collaborative editing** → get a link + QR to send to a partner.
+- **Right-click a folder** → **Create a collaborative note from a link** (like “New Kanban board”).
+- Your partner opens the link in a browser **or** adds the note to their own Obsidian with this plugin.
+- **Sessions survive restarts**: list of shared notes, auto-reconnect, detach a note.
+- Access to a shared note is **only via the signed link**.
 
-1. Установи плагин **BRAT** (Beta Reviewers Auto-update Tool) из каталога Community plugins и включи его.
-2. BRAT → команда **«Add a beta plugin»** (Add beta plugin) → вставь URL этого репозитория:
-   ```
-   https://github.com/delfinchiknakite-netizen/collab-notes-obsidian
-   ```
-3. BRAT скачает последний релиз и установит плагин. Включи **Collab Notes** в Community plugins.
-4. Обновления прилетают автоматически (BRAT → Check for updates).
+## Network use (disclosure)
 
-### На телефоне
-Плагин помечен `isDesktopOnly: false` — ставится и работает в мобильном Obsidian. Установка та же: BRAT → Add beta plugin → URL репозитория. Нужен только доступ в интернет.
+This plugin is a client for a **collaborative-editing server** and therefore uses the network:
 
-## Настройка
+- **HTTPS** `POST /sessions` to create a session and get a shareable link.
+- **WebSocket** to sync document edits and cursor presence in real time.
 
-Settings → **Collab Notes**:
-- **URL сервиса** — адрес collab-сервиса для динамики (по умолчанию `https://rt.av-tarasov.ru`).
-- **Ваше имя** — отображается у вашего курсора у других участников (применяется на лету).
+The server URL is configurable in settings (**Settings → Collab Notes → Service URL**). The default points to the author's public demo service. No analytics or telemetry is sent; only the note content you choose to share is transmitted, and only to the configured server. Point it at your own self-hosted instance if you prefer.
 
-## Использование
+## How it works
 
-1. Открой заметку → **ПКМ** (или меню «•••») → **«Совместное редактирование»**.
-2. Скопируй ссылку / покажи QR → отправь партнёру.
-3. Партнёр открывает ссылку (браузер) или добавляет её в свой Obsidian: команда **«Добавить совместную заметку по ссылке»**, либо **ПКМ по папке → «Создать совместную заметку из ссылки»**.
-4. Управление: у уже общей заметки ПКМ показывает форму (скопировать ссылку / отвязать). Список всех — команда **«Показать совместные заметки»**.
+- **[Yjs](https://github.com/yjs/yjs)** (CRDT) — edits merge without conflicts; the server is a thin relay.
+- **CodeMirror 6** (the same editor Obsidian uses) + `y-codemirror.next` renders remote cursors out of the box.
+- Access is a capability token embedded in the link (HMAC), verified by the server on WebSocket upgrade.
+- The plugin attaches `yCollab` to the active editor via a CM6 `Compartment`, only after the initial sync (to avoid duplicating text).
 
-## Как это устроено (кратко)
+## Installation
 
-- **Yjs** (CRDT) — правки сходятся без конфликтов; **CodeMirror 6** (тот же, что в Obsidian) + `y-codemirror.next` рисует чужие курсоры; **y-websocket** — транспорт.
-- Доступ — capability-токен в ссылке (HMAC), проверяется сервером на WS-upgrade.
-- Плагин цепляется к активному редактору через CM6 `Compartment` и привязывает `yCollab` только после первичной синхронизации (чтобы не задваивать текст).
+### Community plugins
+Once approved: Settings → Community plugins → Browse → search **Collab Notes** → Install → Enable.
 
-## Сборка из исходников
+### Beta via BRAT
+Install **BRAT**, then *Add a beta plugin* with:
+```
+https://github.com/delfinchiknakite-netizen/collab-notes-obsidian
+```
+
+## Usage
+
+1. Open a note → **right-click** (or the “•••” menu) → **Collaborative editing**.
+2. Copy the link / show the QR → send it to a partner.
+3. Partner opens the link in a browser, or adds it to their Obsidian: command **Add a collaborative note by link**, or **right-click a folder → Create a collaborative note from a link**.
+4. Manage: right-clicking an already-shared note shows a management form (copy link / detach). List everything with the command **Show collaborative notes**.
+
+## Settings
+
+- **Service URL** — address of the collab service (default: the author's demo).
+- **Your name** — shown at your cursor to other participants (applied live).
+
+## Building from source
 
 ```bash
 npm install
 npm run build   # → main.js
 ```
-Для локальной установки скопируй `main.js`, `manifest.json`, `styles.css` в `<vault>/.obsidian/plugins/collab-notes/`.
 
-## Релизы
+## License
 
-Тег `vX.Y.Z` (или `X.Y.Z`) → GitHub Actions собирает и публикует релиз с `main.js` + `manifest.json` + `styles.css`. BRAT ставит последний релиз, версия которого совпадает с `manifest.json`.
+[MIT](LICENSE).
 
-## Лицензия
+---
 
-MIT.
+## По-русски
+
+Совместное редактирование markdown-заметок в Obsidian в реальном времени с **живыми курсорами участников** — как в Google Docs. Правый клик по заметке → «Совместное редактирование» → отправь ссылку партнёру. ПКМ по папке → «Создать совместную заметку из ссылки». Работает на десктопе и телефоне. Сетевой доступ: HTTPS `POST /sessions` + WebSocket для синхронизации; адрес сервиса настраивается (Settings → Collab Notes).

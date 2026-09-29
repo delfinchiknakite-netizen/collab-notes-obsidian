@@ -309,7 +309,7 @@ class ResultModal extends Modal {
       .addText((t) => {
         t.setValue(this.link);
         t.inputEl.readOnly = true;
-        t.inputEl.style.width = '100%';
+        t.inputEl.addClass('collab-link-input');
         t.inputEl.onclick = () => t.inputEl.select();
       })
       .addExtraButton((b) => b.setIcon('copy').setTooltip('Скопировать ссылку').onClick(async () => {
@@ -320,8 +320,7 @@ class ResultModal extends Modal {
       const qr = qrcode(0, 'M');
       qr.addData(this.link);
       qr.make();
-      const img = contentEl.createEl('img', { attr: { src: qr.createDataURL(5, 4), alt: 'QR' } });
-      img.style.cssText = 'width:180px;image-rendering:pixelated;display:block;margin:12px auto';
+      contentEl.createEl('img', { attr: { src: qr.createDataURL(5, 4), alt: 'QR' }, cls: 'collab-qr' });
     } catch (e) { /* QR недоступен */ }
 
     const actions = new Setting(contentEl);
@@ -344,10 +343,10 @@ class JoinModal extends Modal {
     }
 
     contentEl.createEl('label', { text: 'Ссылка', cls: 'setting-item-description' });
-    const link = contentEl.createEl('input', { attr: { placeholder: 'https://…/e/<id>#<token>', style: 'width:100%;margin:4px 0 12px' } });
+    const link = contentEl.createEl('input', { attr: { placeholder: 'https://…/e/<id>#<token>' }, cls: 'collab-modal-input' });
 
     contentEl.createEl('label', { text: 'Имя заметки (необязательно)', cls: 'setting-item-description' });
-    const name = contentEl.createEl('input', { attr: { placeholder: 'Совместная заметка', style: 'width:100%;margin:4px 0 8px' } });
+    const name = contentEl.createEl('input', { attr: { placeholder: 'Совместная заметка' }, cls: 'collab-modal-input' });
 
     link.focus();
     const submit = () => { this.close(); this.onSubmit(link.value.trim(), name.value); };

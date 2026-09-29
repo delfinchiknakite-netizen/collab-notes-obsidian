@@ -14,3 +14,8 @@
   z-index: 10;
 }
 .cm-ySelectionCaret { position: relative; border-left: 2px solid; margin-left: -1px; }
+
+/* модалки плагина */
+.collab-link-input { width: 100%; }
+.collab-modal-input { width: 100%; margin: 4px 0 12px; }
+.collab-qr { width: 180px; image-rendering: pixelated; display: block; margin: 12px auto; }

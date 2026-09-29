@@ -1,9 +1,10 @@
 {
   "id": "collab-notes",
   "name": "Collab Notes",
-  "version": "0.1.1",
+  "version": "1.0.0",
   "minAppVersion": "1.4.0",
-  "description": "Совместное редактирование заметок в реальном времени с курсорами участников (подключение к self-hosted collab-сервису).",
+  "description": "Real-time collaborative markdown editing with live participant cursors, powered by a self-hosted CRDT service (Yjs).",
   "author": "avtarasov210",
+  "authorUrl": "https://github.com/delfinchiknakite-netizen",
   "isDesktopOnly": false
 }
