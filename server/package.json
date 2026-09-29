@@ -1,0 +1,13 @@
+{
+  "name": "collab-notes-server",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Minimal signed-link relay for the Collab Notes Obsidian plugin",
+  "scripts": { "start": "node server.mjs" },
+  "dependencies": {
+    "ws": "^8.18.0",
+    "yjs": "^13.6.20",
+    "y-websocket": "^1.5.4"
+  }
+}

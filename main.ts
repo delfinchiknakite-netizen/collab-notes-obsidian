@@ -16,7 +16,7 @@ interface CollabSettings {
   shared: Record<string, SharedInfo>; // path -> сессия (переживает перезапуск)
 }
 const DEFAULTS: CollabSettings = {
-  serviceUrl: 'https://rt.av-tarasov.ru',
+  serviceUrl: '', // сервер не задан по умолчанию — пользователь указывает свой (self-hosted)
   userName: '',
   shared: {},
 };
@@ -145,7 +145,8 @@ export default class CollabNotesPlugin extends Plugin {
     const existing = this.sessions.get(file.path);
     if (existing) { new ResultModal(this.app, existing.link, () => this.leave(file.path)).open(); return; }
 
-    const base = this.settings.serviceUrl.replace(/\/$/, '');
+    const base = this.serviceBase();
+    if (!base) return;
     let res;
     try { res = await requestUrl({ url: base + '/sessions', method: 'POST' }); }
     catch (e) { new Notice('Не удалось создать сессию: ' + (e as Error).message); return; }
@@ -163,6 +164,7 @@ export default class CollabNotesPlugin extends Plugin {
   }
 
   async joinPrompt(folder?: TFolder) {
+    if (!this.serviceBase()) return; // сервер не задан — подсказка показана
     const dir = folder ? folder.path.replace(/\/+$/, '') : '';
     const hint = folder ? (dir === '' ? 'в корне хранилища' : dir) : undefined;
     new JoinModal(this.app, hint, async (link, noteName) => {
@@ -280,15 +282,18 @@ export default class CollabNotesPlugin extends Plugin {
   async loadSettings() {
     this.settings = Object.assign({}, DEFAULTS, await this.loadData());
     if (!this.settings.shared) this.settings.shared = {};
-    // авто-миграция старых адресов: динамика (POST/WS) должна идти на rt.av-tarasov.ru,
-    // а не на CDN collab.av-tarasov.ru (CDN не проксирует POST → 405) и не на старый sslip.
-    const legacy = ['https://collab.av-tarasov.ru', 'http://collab.av-tarasov.ru', 'http://81-26-189-254.sslip.io', 'https://81-26-189-254.sslip.io'];
-    if (legacy.includes((this.settings.serviceUrl || '').replace(/\/$/, ''))) {
-      this.settings.serviceUrl = 'https://rt.av-tarasov.ru';
-      await this.saveSettings();
-    }
   }
   async saveSettings() { await this.saveData(this.settings); }
+
+  // базовый URL сервиса или null (с подсказкой) — сервер задаёт пользователь в настройках
+  private serviceBase(): string | null {
+    const url = (this.settings.serviceUrl || '').trim().replace(/\/$/, '');
+    if (!url) {
+      new Notice('Сначала укажите адрес collab-сервиса: Settings → Collab Notes → URL сервиса');
+      return null;
+    }
+    return url;
+  }
 }
 
 // Форма-результат (как в yc-pages): ссылка + копирование + QR + открыть/закрыть
@@ -395,8 +400,15 @@ class CollabSettingTab extends PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
     containerEl.createEl('h2', { text: 'Collab Notes' });
-    new Setting(containerEl).setName('URL сервиса').setDesc('Адрес collab-сервиса (http/https)')
-      .addText((t) => t.setPlaceholder('http://…sslip.io').setValue(this.plugin.settings.serviceUrl)
+
+    const intro = containerEl.createEl('p', { cls: 'setting-item-description' });
+    intro.appendText('Плагину нужен свой collab-сервер (self-hosted). Разверните его и укажите адрес ниже. Инструкция: ');
+    intro.createEl('a', { text: 'README', attr: { href: 'https://github.com/delfinchiknakite-netizen/collab-notes-obsidian#self-hosting-the-server' } });
+    intro.appendText('.');
+
+    new Setting(containerEl).setName('URL сервиса')
+      .setDesc('Адрес вашего collab-сервиса (https рекомендуется). Без него шаринг недоступен.')
+      .addText((t) => t.setPlaceholder('https://collab.example.com').setValue(this.plugin.settings.serviceUrl)
         .onChange(async (v) => { this.plugin.settings.serviceUrl = v.trim(); await this.plugin.saveSettings(); }));
     new Setting(containerEl).setName('Ваше имя').setDesc('Отображается у вашего курсора для других участников')
       .addText((t) => t.setPlaceholder('Имя').setValue(this.plugin.settings.userName)
