@@ -2,7 +2,7 @@ import {
   App, Plugin, PluginSettingTab, Setting, Notice, Modal, TFile, TFolder, MarkdownView, requestUrl, RequestUrlResponse,
   SettingDefinitionItem,
 } from 'obsidian';
-import { Compartment } from '@codemirror/state';
+import { Compartment, EditorState } from '@codemirror/state';
 import { EditorView } from '@codemirror/view';
 import * as Y from 'yjs';
 import { WebsocketProvider } from 'y-websocket';
@@ -10,7 +10,7 @@ import { yCollab } from 'y-codemirror.next';
 // @ts-ignore — без типов
 import qrcode from 'qrcode-generator';
 
-interface SharedInfo { docId: string; token: string; link: string; }
+interface SharedInfo { docId: string; token: string; link: string; viewLink?: string; }
 interface CollabSettings {
   serviceUrl: string;
   userName: string;
@@ -32,7 +32,14 @@ interface Session {
   ydoc: Y.Doc;
   provider: WebsocketProvider;
   ytext: Y.Text;
-  synced: boolean; // прошла первичная синхронизация с сервером
+  synced: boolean;   // прошла первичная синхронизация с сервером
+  readOnly: boolean; // роль без права записи (viewer) → редактор только для чтения
+}
+
+// роль из токена (role.class.exp.sig или старый perm.exp.sig): может ли писать
+function canWriteToken(token: string): boolean {
+  const r = (token || '').split('.')[0];
+  return r !== 'viewer' && r !== 'view';
 }
 
 function colorFor(name: string): string {
@@ -146,25 +153,28 @@ export default class CollabNotesPlugin extends Plugin {
   async startSession(file: TFile) {
     // уже в совместном режиме → форма управления (закрыть / скопировать ссылку)
     const existing = this.sessions.get(file.path);
-    if (existing) { new ResultModal(this.app, existing.link, () => this.leave(file.path)).open(); return; }
+    if (existing) { new ResultModal(this.app, existing.link, () => this.leave(file.path), this.settings.shared[file.path]?.viewLink).open(); return; }
 
     const base = this.serviceBase();
     if (!base) return;
     let res: RequestUrlResponse;
     try { res = await requestUrl({ url: base + '/sessions', method: 'POST' }); }
     catch (e) { new Notice('Не удалось создать сессию: ' + (e as Error).message); return; }
-    const body = res.json as { docId: string; token: string; link: string };
-    const { docId, token, link } = body;
+    const body = res.json as { docId: string; token: string; link: string; ownerToken?: string; editLink?: string; viewLink?: string };
+    const docId = body.docId;
+    const ownerToken = body.ownerToken || body.token; // владелец «своей» заметки (fallback на старый сервер)
+    const writerLink = body.editLink || body.link;    // ссылка для соавторов (можно править)
+    const viewLink = body.viewLink;                   // ссылка для читателей
 
     await this.app.workspace.getLeaf(false).openFile(file);
     const content = await this.app.vault.read(file);
-    this.connect(file, docId, token, content, link); // мы первые → засеиваем текущим содержимым
+    this.connect(file, docId, ownerToken, content, writerLink); // подключаемся как owner
 
-    this.settings.shared[file.path] = { docId, token, link };
+    this.settings.shared[file.path] = { docId, token: ownerToken, link: writerLink, viewLink };
     await this.saveSettings();
 
-    try { await navigator.clipboard.writeText(link); } catch { /* mobile */ }
-    new ResultModal(this.app, link).open();
+    try { await navigator.clipboard.writeText(writerLink); } catch { /* mobile */ }
+    new ResultModal(this.app, writerLink, undefined, viewLink).open();
   }
 
   async joinPrompt(folder?: TFolder) {
@@ -209,7 +219,7 @@ export default class CollabNotesPlugin extends Plugin {
     const color = colorFor(name);
     provider.awareness.setLocalStateField('user', { name, color, colorLight: color + '55' });
 
-    const session: Session = { file, docId, link, ydoc, provider, ytext, synced: false };
+    const session: Session = { file, docId, link, ydoc, provider, ytext, synced: false, readOnly: !canWriteToken(token) };
     this.sessions.set(file.path, session);
 
     // Привязываем yCollab ТОЛЬКО после первичной синхронизации, иначе входящий с сервера
@@ -241,7 +251,13 @@ export default class CollabNotesPlugin extends Plugin {
     const cm = this.activeCM();
     if (!cm) return;
     this.alignEditor(cm, session.ytext);
-    cm.dispatch({ effects: collab.reconfigure(yCollab(session.ytext, session.provider.awareness)) });
+    cm.dispatch({ effects: collab.reconfigure(this.collabExt(session)) });
+  }
+
+  // yCollab + (для viewer) режим только чтения редактора
+  private collabExt(s: Session) {
+    const base = yCollab(s.ytext, s.provider.awareness);
+    return s.readOnly ? [base, EditorState.readOnly.of(true), EditorView.editable.of(false)] : base;
   }
 
   // выровнять содержимое редактора по ytext ДО привязки yCollab (сервер — источник истины);
@@ -259,7 +275,7 @@ export default class CollabNotesPlugin extends Plugin {
     const s = active ? this.sessions.get(active.path) : undefined;
     if (s && s.synced) {
       this.alignEditor(cm, s.ytext);
-      cm.dispatch({ effects: collab.reconfigure(yCollab(s.ytext, s.provider.awareness)) });
+      cm.dispatch({ effects: collab.reconfigure(this.collabExt(s)) });
     } else {
       cm.dispatch({ effects: collab.reconfigure([]) }); // нет сессии или ещё синхронизируется — свяжем в onSync
     }
@@ -303,7 +319,7 @@ export default class CollabNotesPlugin extends Plugin {
 
 // Форма-результат (как в yc-pages): ссылка + копирование + QR + открыть/закрыть
 class ResultModal extends Modal {
-  constructor(app: App, private link: string, private onLeave?: () => void) { super(app); }
+  constructor(app: App, private link: string, private onLeave?: () => void, private viewLink?: string) { super(app); }
   onOpen() {
     const { contentEl } = this;
     contentEl.empty();
@@ -322,9 +338,18 @@ class ResultModal extends Modal {
         t.inputEl.addClass('collab-link-input');
         t.inputEl.onclick = () => t.inputEl.select();
       })
-      .addExtraButton((b) => b.setIcon('copy').setTooltip('Скопировать ссылку').onClick(async () => {
+      .addExtraButton((b) => b.setIcon('copy').setTooltip('Скопировать ссылку (можно редактировать)').onClick(async () => {
         try { await navigator.clipboard.writeText(this.link); new Notice('Ссылка скопирована'); } catch { /* mobile */ }
       }));
+
+    if (this.viewLink) {
+      const vl = this.viewLink;
+      new Setting(contentEl).setName('Ссылка «только чтение»')
+        .setDesc('Партнёр сможет только читать, без правок.')
+        .addExtraButton((b) => b.setIcon('copy').setTooltip('Скопировать read-only ссылку').onClick(async () => {
+          try { await navigator.clipboard.writeText(vl); new Notice('Read-only ссылка скопирована'); } catch { /* mobile */ }
+        }));
+    }
 
     try {
       const qr = qrcode(0, 'M');
