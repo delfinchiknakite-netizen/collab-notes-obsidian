@@ -1,5 +1,6 @@
 import {
   App, Plugin, PluginSettingTab, Setting, Notice, Modal, TFile, TFolder, MarkdownView, requestUrl, RequestUrlResponse,
+  SettingDefinitionItem,
 } from 'obsidian';
 import { Compartment } from '@codemirror/state';
 import { EditorView } from '@codemirror/view';
@@ -336,7 +337,7 @@ class ResultModal extends Modal {
     actions.addButton((b) => b.setButtonText('Открыть в браузере').onClick(() => window.open(this.link)));
     if (this.onLeave) {
       const onLeave = this.onLeave;
-      actions.addButton((b) => b.setButtonText('Отвязать заметку').setDestructive().onClick(() => { this.close(); onLeave(); }));
+      actions.addButton((b) => b.setButtonText('Отвязать заметку').onClick(() => { this.close(); onLeave(); }));
     }
     actions.addButton((b) => b.setButtonText('Закрыть').setCta().onClick(() => this.close()));
   }
@@ -401,6 +402,31 @@ class SharedListModal extends Modal {
 
 class CollabSettingTab extends PluginSettingTab {
   constructor(app: App, private plugin: CollabNotesPlugin) { super(app, plugin); }
+
+  // Декларативные настройки (Obsidian 1.13+) — попадают в поиск по настройкам.
+  // display() ниже остаётся fallback'ом для более старых версий.
+  getSettingDefinitions(): SettingDefinitionItem[] {
+    return [
+      {
+        name: 'URL сервиса',
+        desc: 'Адрес вашего collab-сервиса (self-hosted, https рекомендуется). Без него шаринг недоступен. Инструкция — в README репозитория.',
+        control: { key: 'serviceUrl', type: 'text', placeholder: 'https://collab.example.com' },
+      },
+      {
+        name: 'Ваше имя',
+        desc: 'Отображается у вашего курсора для других участников.',
+        control: { key: 'userName', type: 'text', placeholder: 'Имя' },
+      },
+    ];
+  }
+
+  async setControlValue(key: string, value: unknown): Promise<void> {
+    const v = typeof value === 'string' ? value.trim() : value;
+    (this.plugin.settings as unknown as Record<string, unknown>)[key] = v;
+    await this.plugin.saveSettings();
+    if (key === 'userName') this.plugin.applyUserName();
+  }
+
   display() {
     const { containerEl } = this;
     containerEl.empty();
