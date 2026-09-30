@@ -17,17 +17,23 @@ interface VaultSyncSettings {
   vaultToken: string;
   index: Record<string, string>; // noteId -> path (локальное зеркало манифеста)
 }
+interface AccountSettings {
+  email: string;
+  token: string; // сессионный токен (не пароль)
+}
 interface CollabSettings {
   serviceUrl: string;
   userName: string;
   shared: Record<string, SharedInfo>; // path -> сессия (переживает перезапуск)
   vault: VaultSyncSettings;           // полный синк хранилища между устройствами
+  account: AccountSettings;           // аккаунт: вход по email/паролю привязывает vault к юзеру
 }
 const DEFAULTS: CollabSettings = {
   serviceUrl: '', // сервер не задан по умолчанию — пользователь указывает свой (self-hosted)
   userName: '',
   shared: {},
   vault: { enabled: false, vaultId: '', vaultToken: '', index: {} },
+  account: { email: '', token: '' },
 };
 
 // применить новый текст к Y.Text минимальным диффом (общий префикс/суффикс) — чтобы
@@ -148,7 +154,7 @@ export default class CollabNotesPlugin extends Plugin {
     // восстановить сессии после перезапуска (переподключиться) + запустить синк vault
     this.app.workspace.onLayoutReady(() => {
       this.restoreSessions();
-      if (this.settings.vault.enabled) void this.vaultSync.start();
+      if (this.settings.vault.enabled) void this.refreshAuth().then(() => this.vaultSync.start());
     });
 
     this.addSettingTab(new CollabSettingTab(this.app, this));
@@ -192,6 +198,54 @@ export default class CollabNotesPlugin extends Plugin {
   }
   vaultKeyString(): string {
     return this.settings.vault.vaultId ? `${this.settings.vault.vaultId}:${this.settings.vault.vaultToken}` : '';
+  }
+
+  // ---------- аккаунты ----------
+  isLoggedIn(): boolean { return !!this.settings.account.token; }
+
+  // общий обработчик ответа /auth/{register,login}: сохранить сессию + привязать vault + включить синк
+  private async applyAuth(data: { userId: string; token: string; email: string; vaultId: string; vaultToken: string }): Promise<void> {
+    this.settings.account = { email: data.email, token: data.token };
+    // если vault сменился (другой аккаунт) — сбросить локальное зеркало манифеста
+    const sameVault = this.settings.vault.vaultId === data.vaultId;
+    this.settings.vault = { enabled: true, vaultId: data.vaultId, vaultToken: data.vaultToken, index: sameVault ? this.settings.vault.index : {} };
+    await this.saveSettings();
+    this.vaultSync.stop();
+    await this.vaultSync.start();
+  }
+  async authRegister(email: string, password: string): Promise<void> {
+    const base = this.serviceBase(); if (!base) { new Notice('Сначала укажите адрес сервера'); return; }
+    const res = await requestUrl({ url: base + '/auth/register', method: 'POST', contentType: 'application/json', body: JSON.stringify({ email, password }), throw: false });
+    if (res.status >= 400) { new Notice('Регистрация: ' + ((res.json as { error?: string })?.error || res.status)); return; }
+    await this.applyAuth(res.json as { userId: string; token: string; email: string; vaultId: string; vaultToken: string });
+    new Notice('Аккаунт создан, синк включён');
+  }
+  async authLogin(email: string, password: string): Promise<void> {
+    const base = this.serviceBase(); if (!base) { new Notice('Сначала укажите адрес сервера'); return; }
+    const res = await requestUrl({ url: base + '/auth/login', method: 'POST', contentType: 'application/json', body: JSON.stringify({ email, password }), throw: false });
+    if (res.status >= 400) { new Notice('Вход: ' + ((res.json as { error?: string })?.error || res.status)); return; }
+    await this.applyAuth(res.json as { userId: string; token: string; email: string; vaultId: string; vaultToken: string });
+    new Notice('Вход выполнен, синк включён');
+  }
+  async authLogout(): Promise<void> {
+    this.vaultSync.stop();
+    this.settings.account = { email: '', token: '' };
+    this.settings.vault = { enabled: false, vaultId: '', vaultToken: '', index: {} };
+    await this.saveSettings();
+    new Notice('Вы вышли из аккаунта');
+  }
+  // при запуске обновить vault-токен по сессии (перевыпускается, не протухает пока жив аккаунт)
+  async refreshAuth(): Promise<void> {
+    if (!this.settings.account.token) return;
+    const base = this.serviceBase(); if (!base) return;
+    try {
+      const res = await requestUrl({ url: base + '/auth/me?token=' + encodeURIComponent(this.settings.account.token), method: 'GET', throw: false });
+      if (res.status >= 400) return; // сессия истекла — попросим войти заново, локальный ключ ещё поработает
+      const d = res.json as { vaultId: string; vaultToken: string; email: string };
+      this.settings.vault.vaultId = d.vaultId; this.settings.vault.vaultToken = d.vaultToken;
+      this.settings.account.email = d.email;
+      await this.saveSettings();
+    } catch { /* офлайн — используем сохранённый токен */ }
   }
   setVaultKey(key: string): boolean {
     const i = (key || '').indexOf(':');
@@ -779,6 +833,25 @@ class CollabSettingTab extends PluginSettingTab {
           await this.plugin.saveSettings();
           this.plugin.applyUserName();
         }));
+
+    // ---- аккаунт ----
+    new Setting(containerEl).setName('Аккаунт').setHeading();
+    if (this.plugin.isLoggedIn()) {
+      new Setting(containerEl).setName('Вы вошли')
+        .setDesc(this.plugin.settings.account.email + ' — ваше хранилище синхронизируется. Войдите этим же аккаунтом на другом устройстве, чтобы получить те же заметки.')
+        .addButton((b) => b.setButtonText('Выйти').onClick(async () => { await this.plugin.authLogout(); this.display(); }));
+    } else {
+      const acctDesc = containerEl.createEl('p', { cls: 'setting-item-description' });
+      acctDesc.appendText('Войдите или зарегистрируйтесь — сервис привяжет ваше хранилище к аккаунту. На любом устройстве войдите тем же email/паролем, и заметки синхронизируются автоматически (без ручного копирования ключа).');
+      let em = '', pw = '';
+      new Setting(containerEl).setName('Email')
+        .addText((t) => { t.setPlaceholder('you@example.com').inputEl.type = 'email'; t.onChange((val) => { em = val.trim(); }); });
+      new Setting(containerEl).setName('Пароль').setDesc('Минимум 6 символов.')
+        .addText((t) => { t.inputEl.type = 'password'; t.setPlaceholder('••••••'); t.onChange((val) => { pw = val; }); });
+      new Setting(containerEl)
+        .addButton((b) => b.setButtonText('Войти').setCta().onClick(async () => { await this.plugin.authLogin(em, pw); this.display(); }))
+        .addButton((b) => b.setButtonText('Регистрация').onClick(async () => { await this.plugin.authRegister(em, pw); this.display(); }));
+    }
 
     // ---- синхронизация хранилища ----
     new Setting(containerEl).setName('Синхронизация хранилища (beta)').setHeading();
