@@ -1,6 +1,6 @@
 import {
   App, Plugin, PluginSettingTab, Setting, Notice, Modal, TFile, TFolder, MarkdownView, requestUrl, RequestUrlResponse,
-  SettingDefinitionItem,
+  SettingDefinitionItem, EventRef,
 } from 'obsidian';
 import { Compartment, EditorState } from '@codemirror/state';
 import { EditorView } from '@codemirror/view';
@@ -11,16 +11,42 @@ import { yCollab } from 'y-codemirror.next';
 import qrcode from 'qrcode-generator';
 
 interface SharedInfo { docId: string; token: string; link: string; viewLink?: string; }
+interface VaultSyncSettings {
+  enabled: boolean;
+  vaultId: string;
+  vaultToken: string;
+  index: Record<string, string>; // noteId -> path (локальное зеркало манифеста)
+}
 interface CollabSettings {
   serviceUrl: string;
   userName: string;
   shared: Record<string, SharedInfo>; // path -> сессия (переживает перезапуск)
+  vault: VaultSyncSettings;           // полный синк хранилища между устройствами
 }
 const DEFAULTS: CollabSettings = {
   serviceUrl: '', // сервер не задан по умолчанию — пользователь указывает свой (self-hosted)
   userName: '',
   shared: {},
+  vault: { enabled: false, vaultId: '', vaultToken: '', index: {} },
 };
+
+// применить новый текст к Y.Text минимальным диффом (общий префикс/суффикс) — чтобы
+// параллельные правки с разных устройств мержились по-символьно, а не затирались целиком.
+function applyTextToYText(ytext: Y.Text, next: string): void {
+  const cur = ytext.toString();
+  if (cur === next) return;
+  let start = 0;
+  const min = Math.min(cur.length, next.length);
+  while (start < min && cur[start] === next[start]) start++;
+  let endCur = cur.length, endNext = next.length;
+  while (endCur > start && endNext > start && cur[endCur - 1] === next[endNext - 1]) { endCur--; endNext--; }
+  const doc = ytext.doc;
+  const mutate = () => {
+    if (endCur > start) ytext.delete(start, endCur - start);
+    if (endNext > start) ytext.insert(start, next.slice(start, endNext));
+  };
+  if (doc) doc.transact(mutate); else mutate();
+}
 
 // один общий compartment на все редакторы: активной заметке с сессией — yCollab, остальным пусто
 const collab = new Compartment();
@@ -52,9 +78,11 @@ export default class CollabNotesPlugin extends Plugin {
   settings: CollabSettings;
   sessions = new Map<string, Session>();
   statusEl: HTMLElement;
+  vaultSync!: VaultSync;
 
   async onload() {
     await this.loadSettings();
+    this.vaultSync = new VaultSync(this);
     this.registerEditorExtension([collab.of([])]);
 
     const collabTitle = (path: string) => (this.sessions.has(path) ? 'Совместное редактирование — управление' : 'Совместное редактирование');
@@ -117,8 +145,11 @@ export default class CollabNotesPlugin extends Plugin {
       }
     }));
 
-    // восстановить сессии после перезапуска (переподключиться)
-    this.app.workspace.onLayoutReady(() => this.restoreSessions());
+    // восстановить сессии после перезапуска (переподключиться) + запустить синк vault
+    this.app.workspace.onLayoutReady(() => {
+      this.restoreSessions();
+      if (this.settings.vault.enabled) void this.vaultSync.start();
+    });
 
     this.addSettingTab(new CollabSettingTab(this.app, this));
   }
@@ -135,8 +166,40 @@ export default class CollabNotesPlugin extends Plugin {
   }
 
   onunload() {
+    this.vaultSync?.stop();
     this.sessions.forEach((s) => s.provider.destroy());
     this.sessions.clear();
+  }
+
+  // включить синк vault (создаёт vault-ключ, если его ещё нет)
+  async enableVaultSync(): Promise<void> {
+    if (!this.settings.vault.vaultId) {
+      const base = this.serviceBase(); if (!base) return;
+      try {
+        const res = await requestUrl({ url: base + '/vault', method: 'POST' });
+        const v = res.json as { vaultId: string; vaultToken: string };
+        this.settings.vault.vaultId = v.vaultId; this.settings.vault.vaultToken = v.vaultToken; this.settings.vault.index = {};
+      } catch (e) { new Notice('Не удалось создать vault: ' + (e as Error).message); return; }
+    }
+    this.settings.vault.enabled = true;
+    await this.saveSettings();
+    await this.vaultSync.start();
+  }
+  async disableVaultSync(): Promise<void> {
+    this.settings.vault.enabled = false;
+    await this.saveSettings();
+    this.vaultSync.stop();
+  }
+  vaultKeyString(): string {
+    return this.settings.vault.vaultId ? `${this.settings.vault.vaultId}:${this.settings.vault.vaultToken}` : '';
+  }
+  setVaultKey(key: string): boolean {
+    const i = (key || '').indexOf(':');
+    if (i <= 0) return false;
+    const vaultId = key.slice(0, i), vaultToken = key.slice(i + 1);
+    if (!vaultId || !vaultToken) return false;
+    this.settings.vault = { enabled: true, vaultId, vaultToken, index: {} };
+    return true;
   }
 
   private activeCM(): EditorView | null {
@@ -348,6 +411,219 @@ export default class CollabNotesPlugin extends Plugin {
   }
 }
 
+// ---------- Полный синк хранилища (vault) ----------
+// Каждая .md-заметка = Y.Doc в неймспейсе <vaultId>.<noteId>; список файлов — манифест-док
+// <vaultId>.manifest (Y.Map noteId -> {path, deleted}). Мост файл↔CRDT: правки файла уходят в
+// Y.Text минимальным диффом, правки CRDT пишутся в файл. Петли гасятся набором writing.
+// Данные не теряются: удаление → в корзину, конфликт при join → сохраняется копия.
+interface NoteConn { doc: Y.Doc; provider: WebsocketProvider; ytext: Y.Text; obs: () => void; timer: number | null; }
+class VaultSync {
+  private manifest: { doc: Y.Doc; provider: WebsocketProvider; files: Y.Map<{ path: string; deleted?: boolean }> } | null = null;
+  private notes = new Map<string, NoteConn>(); // noteId -> соединение
+  private writing = new Set<string>();          // пути, которые сейчас пишет синк (гасим watcher)
+  private refs: EventRef[] = [];
+  private ready = false;
+
+  constructor(private plugin: CollabNotesPlugin) {}
+  private get app(): App { return this.plugin.app; }
+  private get s(): VaultSyncSettings { return this.plugin.settings.vault; }
+  private wsBase(): string { return this.plugin.settings.serviceUrl.replace(/\/$/, '').replace(/^http/, 'ws') + '/ws'; }
+  private ns(noteId: string): string { return this.s.vaultId + '.' + noteId; }
+  private newId(): string { return Math.random().toString(36).slice(2, 10) + Date.now().toString(36); }
+  private pathToId(path: string): string | undefined { return Object.keys(this.s.index).find((id) => this.s.index[id] === path); }
+
+  async start(): Promise<void> {
+    if (this.manifest || !this.s.vaultId || !this.s.vaultToken || !this.plugin.settings.serviceUrl) return;
+    const doc = new Y.Doc();
+    const provider = new WebsocketProvider(this.wsBase(), this.s.vaultId + '.manifest', doc, { params: { token: this.s.vaultToken } });
+    const files = doc.getMap('files') as Y.Map<{ path: string; deleted?: boolean }>;
+    this.manifest = { doc, provider, files };
+    const onSync = (isSynced: boolean) => { if (isSynced && !this.ready) { this.ready = true; void this.reconcile(); } };
+    provider.on('sync', onSync);
+    if (provider.synced) onSync(true);
+    files.observe(() => void this.onManifestChange());
+    this.refs.push(this.app.vault.on('modify', (f) => { if (f instanceof TFile && f.extension === 'md') void this.onFileChanged(f); }));
+    this.refs.push(this.app.vault.on('create', (f) => { if (this.ready && f instanceof TFile && f.extension === 'md') void this.onFileChanged(f); }));
+    this.refs.push(this.app.vault.on('delete', (f) => { if (f instanceof TFile && f.extension === 'md') void this.onFileDeleted(f.path); }));
+    this.refs.push(this.app.vault.on('rename', (f, oldPath) => { if (f instanceof TFile && f.extension === 'md') void this.onFileRenamed(f, oldPath); }));
+    new Notice('Синхронизация хранилища включена');
+  }
+
+  stop(): void {
+    for (const r of this.refs) this.app.vault.offref(r);
+    this.refs = [];
+    for (const [, n] of this.notes) { if (n.timer) window.clearTimeout(n.timer); n.ytext.unobserve(n.obs); n.provider.destroy(); n.doc.destroy(); }
+    this.notes.clear();
+    if (this.manifest) { this.manifest.provider.destroy(); this.manifest.doc.destroy(); this.manifest = null; }
+    this.ready = false;
+  }
+
+  // начальная сверка локальных файлов и манифеста
+  private async reconcile(): Promise<void> {
+    if (!this.manifest) return;
+    const files = this.manifest.files;
+    for (const [noteId, meta] of files) {
+      const local = this.app.vault.getAbstractFileByPath(meta.path);
+      if (meta.deleted) {
+        if (local instanceof TFile && this.s.index[noteId]) await this.trash(local);
+        delete this.s.index[noteId];
+        continue;
+      }
+      this.connectNote(noteId, meta.path);
+    }
+    const known = new Set<string>();
+    for (const [, m] of files) if (!m.deleted) known.add(m.path);
+    for (const f of this.app.vault.getMarkdownFiles()) if (!known.has(f.path)) await this.addLocalFile(f);
+    await this.plugin.saveSettings();
+  }
+
+  // добавить локальный файл в vault (создать noteId + запись в манифесте + доку)
+  private async addLocalFile(file: TFile): Promise<void> {
+    if (!this.manifest || this.pathToId(file.path)) return;
+    const noteId = this.newId();
+    this.s.index[noteId] = file.path;
+    this.manifest.files.set(noteId, { path: file.path });
+    const content = await this.app.vault.read(file);
+    this.connectNote(noteId, file.path, content);
+    await this.plugin.saveSettings();
+  }
+
+  // подключить док заметки и связать с файлом
+  private connectNote(noteId: string, path: string, seed?: string): void {
+    if (this.notes.has(noteId)) return;
+    this.s.index[noteId] = path;
+    const doc = new Y.Doc();
+    const provider = new WebsocketProvider(this.wsBase(), this.ns(noteId), doc, { params: { token: this.s.vaultToken } });
+    const ytext = doc.getText('body');
+    const conn: NoteConn = { doc, provider, ytext, obs: () => {}, timer: null };
+    conn.obs = () => this.scheduleWriteFile(noteId);
+    this.notes.set(noteId, conn);
+
+    let synced = false;
+    const onSync = (isSynced: boolean) => {
+      if (!isSynced || synced) return; synced = true;
+      void this.onNoteSynced(noteId, path, ytext, seed);
+      ytext.observe(conn.obs);
+    };
+    provider.on('sync', onSync);
+    if (provider.synced) onSync(true);
+  }
+
+  // первичная сверка содержимого дока и файла
+  private async onNoteSynced(noteId: string, path: string, ytext: Y.Text, seed?: string): Promise<void> {
+    const remote = ytext.toString();
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (ytext.length === 0) {
+      // новый док → засеять содержимым файла
+      const text = seed ?? (file instanceof TFile ? await this.app.vault.read(file) : '');
+      if (text) applyTextToYText(ytext, text);
+      if (!(file instanceof TFile)) await this.writeFile(path, text); // создать локально, если нет
+      return;
+    }
+    if (file instanceof TFile) {
+      const local = await this.app.vault.read(file);
+      if (local !== remote) {
+        // конфликт: сохраняем локальную версию копией, файл приводим к vault
+        await this.saveConflictCopy(path, local);
+        await this.writeFile(path, remote);
+      }
+    } else {
+      await this.writeFile(path, remote); // нет локально → вытянуть из vault
+    }
+  }
+
+  // файл изменён/создан → в Y.Text (мин. диффом)
+  private async onFileChanged(file: TFile): Promise<void> {
+    if (!this.ready || this.writing.has(file.path)) return;
+    let noteId = this.pathToId(file.path);
+    if (!noteId) { await this.addLocalFile(file); return; }
+    const conn = this.notes.get(noteId);
+    if (!conn) { this.connectNote(noteId, file.path); return; }
+    const text = await this.app.vault.read(file);
+    applyTextToYText(conn.ytext, text);
+  }
+
+  private async onFileDeleted(path: string): Promise<void> {
+    if (!this.ready || this.writing.has(path)) return;
+    const noteId = this.pathToId(path);
+    if (!noteId || !this.manifest) return;
+    this.manifest.files.set(noteId, { path, deleted: true });
+    const conn = this.notes.get(noteId);
+    if (conn) { if (conn.timer) window.clearTimeout(conn.timer); conn.ytext.unobserve(conn.obs); conn.provider.destroy(); conn.doc.destroy(); this.notes.delete(noteId); }
+    delete this.s.index[noteId];
+    await this.plugin.saveSettings();
+  }
+
+  private async onFileRenamed(file: TFile, oldPath: string): Promise<void> {
+    if (!this.ready) return;
+    const noteId = this.pathToId(oldPath);
+    if (!noteId || !this.manifest) { void this.onFileChanged(file); return; }
+    this.s.index[noteId] = file.path;
+    this.manifest.files.set(noteId, { path: file.path });
+    await this.plugin.saveSettings();
+  }
+
+  // манифест изменился на другом устройстве → применить создания/переименования/удаления локально
+  private async onManifestChange(): Promise<void> {
+    if (!this.ready || !this.manifest) return;
+    for (const [noteId, meta] of this.manifest.files) {
+      const knownPath = this.s.index[noteId];
+      if (meta.deleted) {
+        const f = this.app.vault.getAbstractFileByPath(meta.path);
+        if (f instanceof TFile) await this.trash(f);
+        if (knownPath) { const c = this.notes.get(noteId); if (c) { c.provider.destroy(); c.doc.destroy(); this.notes.delete(noteId); } delete this.s.index[noteId]; }
+        continue;
+      }
+      if (knownPath && knownPath !== meta.path) { // переименование с другого устройства
+        const f = this.app.vault.getAbstractFileByPath(knownPath);
+        if (f instanceof TFile) { this.writing.add(meta.path); try { await this.app.fileManager.renameFile(f, meta.path); } catch { /* конфликт имени */ } finally { window.setTimeout(() => this.writing.delete(meta.path), 500); } }
+        this.s.index[noteId] = meta.path;
+      } else if (!knownPath) { // новая заметка с другого устройства
+        this.connectNote(noteId, meta.path);
+      }
+    }
+    await this.plugin.saveSettings();
+  }
+
+  // записать Y.Text заметки в файл (дебаунс)
+  private scheduleWriteFile(noteId: string): void {
+    const conn = this.notes.get(noteId);
+    if (!conn) return;
+    if (conn.timer) window.clearTimeout(conn.timer);
+    conn.timer = window.setTimeout(() => { void this.writeFile(this.s.index[noteId], conn.ytext.toString()); }, 250);
+  }
+
+  private async writeFile(path: string, text: string): Promise<void> {
+    if (!path) return;
+    this.writing.add(path);
+    try {
+      const f = this.app.vault.getAbstractFileByPath(path);
+      if (f instanceof TFile) { if ((await this.app.vault.read(f)) !== text) await this.app.vault.modify(f, text); }
+      else { await this.ensureFolder(path); await this.app.vault.create(path, text); }
+    } catch (e) { /* ignore */ }
+    finally { window.setTimeout(() => this.writing.delete(path), 500); }
+  }
+
+  private async ensureFolder(path: string): Promise<void> {
+    const dir = path.split('/').slice(0, -1).join('/');
+    if (dir && !this.app.vault.getAbstractFileByPath(dir)) { try { await this.app.vault.createFolder(dir); } catch { /* уже есть */ } }
+  }
+
+  private async saveConflictCopy(path: string, content: string): Promise<void> {
+    const base = path.replace(/\.md$/i, '');
+    const cp = `${base} (конфликт ${new Date().toISOString().slice(0, 10)}).md`;
+    this.writing.add(cp);
+    try { if (!this.app.vault.getAbstractFileByPath(cp)) await this.app.vault.create(cp, content); } catch { /* ignore */ }
+    finally { window.setTimeout(() => this.writing.delete(cp), 500); }
+  }
+
+  private async trash(file: TFile): Promise<void> {
+    this.writing.add(file.path);
+    try { await this.app.vault.trash(file, false); } catch { /* ignore */ }
+    finally { window.setTimeout(() => this.writing.delete(file.path), 500); }
+  }
+}
+
 // Форма-результат (как в yc-pages): ссылка + копирование + QR + открыть/закрыть
 class ResultModal extends Modal {
   constructor(app: App, private link: string, private onLeave?: () => void, private viewLink?: string) { super(app); }
@@ -503,5 +779,33 @@ class CollabSettingTab extends PluginSettingTab {
           await this.plugin.saveSettings();
           this.plugin.applyUserName();
         }));
+
+    // ---- синхронизация хранилища ----
+    new Setting(containerEl).setName('Синхронизация хранилища (beta)').setHeading();
+    const warn = containerEl.createEl('p', { cls: 'setting-item-description' });
+    warn.appendText('Синхронизирует все .md-заметки между устройствами через ваш сервер. ⚠️ Бета — сделайте резервную копию хранилища. Вложения (картинки и т.п.) пока не синхронизируются. Данные не удаляются безвозвратно (в корзину), конфликты сохраняются копией.');
+
+    const v = this.plugin.settings.vault;
+    if (!v.enabled) {
+      new Setting(containerEl).setName('Включить синхронизацию')
+        .setDesc('Создаст «ключ хранилища» на вашем сервере и начнёт синк текущего vault.')
+        .addButton((b) => b.setButtonText('Включить').setCta().onClick(async () => { await this.plugin.enableVaultSync(); this.display(); }));
+      let keyInput = '';
+      new Setting(containerEl).setName('…или подключить к существующему')
+        .setDesc('Вставьте «ключ хранилища» с другого устройства, чтобы синхронизировать тот же vault.')
+        .addText((t) => { t.setPlaceholder('vaultId:token'); t.onChange((val) => { keyInput = val.trim(); }); })
+        .addButton((b) => b.setButtonText('Подключить').onClick(async () => {
+          if (!this.plugin.setVaultKey(keyInput)) { new Notice('Неверный ключ (формат vaultId:token)'); return; }
+          await this.plugin.saveSettings(); await this.plugin.vaultSync.start(); this.display();
+        }));
+    } else {
+      new Setting(containerEl).setName('Синхронизация включена').setDesc('Заметок в индексе: ' + Object.keys(v.index).length)
+        .addButton((b) => b.setButtonText('Выключить').onClick(async () => { await this.plugin.disableVaultSync(); this.display(); }));
+      new Setting(containerEl).setName('Ключ хранилища')
+        .setDesc('Скопируйте на другое устройство (Подключить к существующему), чтобы синхронизировать тот же vault. Держите ключ в секрете.')
+        .addButton((b) => b.setButtonText('Скопировать ключ').onClick(async () => {
+          try { await navigator.clipboard.writeText(this.plugin.vaultKeyString()); new Notice('Ключ хранилища скопирован'); } catch { /* mobile */ }
+        }));
+    }
   }
 }
