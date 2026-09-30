@@ -1,5 +1,5 @@
 import {
-  App, Plugin, PluginSettingTab, Setting, Notice, Modal, TFile, TFolder, MarkdownView, requestUrl,
+  App, Plugin, PluginSettingTab, Setting, Notice, Modal, TFile, TFolder, MarkdownView, requestUrl, RequestUrlResponse,
 } from 'obsidian';
 import { Compartment } from '@codemirror/state';
 import { EditorView } from '@codemirror/view';
@@ -54,18 +54,18 @@ export default class CollabNotesPlugin extends Plugin {
     // ПКМ по заметке / по папке
     this.registerEvent(this.app.workspace.on('file-menu', (menu, file) => {
       if (file instanceof TFile && file.extension === 'md') {
-        menu.addItem((i) => i.setTitle(collabTitle(file.path)).setIcon('users').onClick(() => this.startSession(file)));
+        menu.addItem((i) => i.setTitle(collabTitle(file.path)).setIcon('users').onClick(() => void this.startSession(file)));
       } else if (file instanceof TFolder) {
         // как «Новая доска Kanban / Canvas» — создать заметку из совместной ссылки прямо в папке
-        menu.addItem((i) => i.setTitle('Создать совместную заметку из ссылки').setIcon('users').onClick(() => this.joinPrompt(file)));
+        menu.addItem((i) => i.setTitle('Создать совместную заметку из ссылки').setIcon('users').onClick(() => void this.joinPrompt(file)));
       }
     }));
 
     // меню «•••» / три точки в открытой заметке
-    this.registerEvent(this.app.workspace.on('editor-menu', (menu, editor, view) => {
-      const file = (view as any)?.file as TFile | undefined;
+    this.registerEvent(this.app.workspace.on('editor-menu', (menu, editor, info) => {
+      const file = info.file;
       if (file && file.extension === 'md') {
-        menu.addItem((i) => i.setTitle(collabTitle(file.path)).setIcon('users').onClick(() => this.startSession(file)));
+        menu.addItem((i) => i.setTitle(collabTitle(file.path)).setIcon('users').onClick(() => void this.startSession(file)));
       }
     }));
 
@@ -74,11 +74,11 @@ export default class CollabNotesPlugin extends Plugin {
       checkCallback: (checking) => {
         const f = this.app.workspace.getActiveFile();
         if (checking) return !!f && f.extension === 'md';
-        if (f) this.startSession(f);
+        if (f) void this.startSession(f);
         return true;
       },
     });
-    this.addCommand({ id: 'join', name: 'Добавить совместную заметку по ссылке', callback: () => this.joinPrompt() });
+    this.addCommand({ id: 'join', name: 'Добавить совместную заметку по ссылке', callback: () => void this.joinPrompt() });
     this.addCommand({
       id: 'leave', name: 'Отвязать заметку от совместного редактирования',
       checkCallback: (checking) => {
@@ -98,13 +98,14 @@ export default class CollabNotesPlugin extends Plugin {
 
     // переименование заметки — обновить ключи
     this.registerEvent(this.app.vault.on('rename', (file, oldPath) => {
+      if (!(file instanceof TFile)) return;
       if (this.settings.shared[oldPath]) {
         const info = this.settings.shared[oldPath];
         delete this.settings.shared[oldPath];
-        this.settings.shared[(file as TFile).path] = info;
+        this.settings.shared[file.path] = info;
         const s = this.sessions.get(oldPath);
-        if (s) { this.sessions.delete(oldPath); s.file = file as TFile; this.sessions.set((file as TFile).path, s); }
-        this.saveSettings();
+        if (s) { this.sessions.delete(oldPath); s.file = file; this.sessions.set(file.path, s); }
+        void this.saveSettings();
       }
     }));
 
@@ -121,7 +122,7 @@ export default class CollabNotesPlugin extends Plugin {
       if (file instanceof TFile) this.connect(file, info.docId, info.token, null, info.link);
       else { delete this.settings.shared[path]; changed = true; }
     }
-    if (changed) this.saveSettings();
+    if (changed) void this.saveSettings();
     this.refreshBinding();
   }
 
@@ -132,8 +133,9 @@ export default class CollabNotesPlugin extends Plugin {
 
   private activeCM(): EditorView | null {
     const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-    // @ts-ignore — Obsidian отдаёт CM6 EditorView через editor.cm
-    return (view && (view.editor as any)?.cm) || null;
+    if (!view) return null;
+    // Obsidian отдаёт CM6 EditorView через editor.cm (нет в публичных типах)
+    return (view.editor as { cm?: EditorView }).cm ?? null;
   }
 
   private wsBase(): string {
@@ -147,10 +149,11 @@ export default class CollabNotesPlugin extends Plugin {
 
     const base = this.serviceBase();
     if (!base) return;
-    let res;
+    let res: RequestUrlResponse;
     try { res = await requestUrl({ url: base + '/sessions', method: 'POST' }); }
     catch (e) { new Notice('Не удалось создать сессию: ' + (e as Error).message); return; }
-    const { docId, token, link } = res.json as { docId: string; token: string; link: string };
+    const body = res.json as { docId: string; token: string; link: string };
+    const { docId, token, link } = body;
 
     await this.app.workspace.getLeaf(false).openFile(file);
     const content = await this.app.vault.read(file);
@@ -219,7 +222,7 @@ export default class CollabNotesPlugin extends Plugin {
     provider.on('sync', onSync);
     if (provider.synced) onSync(true);
 
-    provider.on('status', (e: any) => this.updateStatus(e.status === 'connected'));
+    provider.on('status', (e: { status: string }) => this.updateStatus(e.status === 'connected'));
     provider.awareness.on('change', () => this.updateStatus(provider.wsconnected));
   }
 
@@ -266,7 +269,7 @@ export default class CollabNotesPlugin extends Plugin {
     const active = this.app.workspace.getActiveFile();
     const s = active ? this.sessions.get(active.path) : undefined;
     if (!s) { this.statusEl.setText(''); return; }
-    const peers = [...s.provider.awareness.getStates().values()].map((x: any) => x.user).filter(Boolean).length;
+    const peers = [...s.provider.awareness.getStates().values()].map((x: { user?: unknown }) => x.user).filter(Boolean).length;
     this.statusEl.setText('👥 ' + (connected ? 'на связи' : '…') + ' · ' + peers);
   }
 
@@ -274,13 +277,14 @@ export default class CollabNotesPlugin extends Plugin {
     const s = this.sessions.get(path);
     if (s) { s.provider.destroy(); this.sessions.delete(path); }
     delete this.settings.shared[path];
-    this.saveSettings();
+    void this.saveSettings();
     this.refreshBinding();
     new Notice('Заметка отвязана от совместного редактирования (текст сохранён)');
   }
 
   async loadSettings() {
-    this.settings = Object.assign({}, DEFAULTS, await this.loadData());
+    const data = (await this.loadData()) as Partial<CollabSettings> | null;
+    this.settings = Object.assign({}, DEFAULTS, data);
     if (!this.settings.shared) this.settings.shared = {};
   }
   async saveSettings() { await this.saveData(this.settings); }
@@ -302,7 +306,7 @@ class ResultModal extends Modal {
   onOpen() {
     const { contentEl } = this;
     contentEl.empty();
-    contentEl.createEl('h3', { text: 'Совместное редактирование' });
+    this.setTitle('Совместное редактирование');
     contentEl.createEl('p', {
       text: this.onLeave
         ? 'Заметка уже в совместном режиме. Можно скопировать ссылку ещё раз или закрыть совместное редактирование.'
@@ -326,12 +330,13 @@ class ResultModal extends Modal {
       qr.addData(this.link);
       qr.make();
       contentEl.createEl('img', { attr: { src: qr.createDataURL(5, 4), alt: 'QR' }, cls: 'collab-qr' });
-    } catch (e) { /* QR недоступен */ }
+    } catch { /* QR недоступен */ }
 
     const actions = new Setting(contentEl);
     actions.addButton((b) => b.setButtonText('Открыть в браузере').onClick(() => window.open(this.link)));
     if (this.onLeave) {
-      actions.addButton((b) => b.setButtonText('Отвязать заметку').setWarning().onClick(() => { this.close(); this.onLeave!(); }));
+      const onLeave = this.onLeave;
+      actions.addButton((b) => b.setButtonText('Отвязать заметку').setDestructive().onClick(() => { this.close(); onLeave(); }));
     }
     actions.addButton((b) => b.setButtonText('Закрыть').setCta().onClick(() => this.close()));
   }
@@ -339,10 +344,10 @@ class ResultModal extends Modal {
 }
 
 class JoinModal extends Modal {
-  constructor(app: App, private folderHint: string | undefined, private onSubmit: (link: string, noteName: string) => void) { super(app); }
+  constructor(app: App, private folderHint: string | undefined, private onSubmit: (link: string, noteName: string) => void | Promise<void>) { super(app); }
   onOpen() {
     const { contentEl } = this;
-    contentEl.createEl('h3', { text: 'Совместная заметка из ссылки' });
+    this.setTitle('Совместная заметка из ссылки');
     if (this.folderHint !== undefined) {
       contentEl.createEl('p', { text: 'Заметка будет создана ' + this.folderHint, cls: 'setting-item-description' });
     }
@@ -354,7 +359,7 @@ class JoinModal extends Modal {
     const name = contentEl.createEl('input', { attr: { placeholder: 'Совместная заметка' }, cls: 'collab-modal-input' });
 
     link.focus();
-    const submit = () => { this.close(); this.onSubmit(link.value.trim(), name.value); };
+    const submit = () => { this.close(); void this.onSubmit(link.value.trim(), name.value); };
     new Setting(contentEl).addButton((b) => b.setButtonText('Создать и подключиться').setCta().onClick(submit));
     link.addEventListener('keydown', (e) => { if (e.key === 'Enter') submit(); });
     name.addEventListener('keydown', (e) => { if (e.key === 'Enter') submit(); });
@@ -368,7 +373,7 @@ class SharedListModal extends Modal {
   onOpen() {
     const { contentEl } = this;
     contentEl.empty();
-    contentEl.createEl('h3', { text: 'Совместные заметки' });
+    this.setTitle('Совместные заметки');
     const entries = Object.entries(this.plugin.settings.shared);
     if (!entries.length) {
       contentEl.createEl('p', { text: 'Пока нет совместных заметок. ПКМ по заметке → «Совместное редактирование».', cls: 'setting-item-description' });
@@ -399,7 +404,6 @@ class CollabSettingTab extends PluginSettingTab {
   display() {
     const { containerEl } = this;
     containerEl.empty();
-    containerEl.createEl('h2', { text: 'Collab Notes' });
 
     const intro = containerEl.createEl('p', { cls: 'setting-item-description' });
     intro.appendText('Плагину нужен свой collab-сервер (self-hosted). Разверните его и укажите адрес ниже. Инструкция: ');
