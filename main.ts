@@ -199,6 +199,19 @@ export default class CollabNotesPlugin extends Plugin {
       let path = at(base);
       for (let i = 2; this.app.vault.getAbstractFileByPath(path); i++) path = at(base + ' ' + i);
 
+      // read-only (viewer) ссылка → разовая КОПИЯ в vault, БЕЗ привязки к чужому vault
+      if (!canWriteToken(token)) {
+        let content = '';
+        try { content = await this.fetchDocContent(docId, token); } catch { /* оставим пустой */ }
+        let file: TFile;
+        try { file = await this.app.vault.create(path, content); }
+        catch (e) { new Notice('Не удалось создать заметку: ' + (e as Error).message); return; }
+        await this.app.workspace.getLeaf(false).openFile(file);
+        new Notice('Заметка скопирована в хранилище (только чтение — статичная копия, без синхронизации)');
+        return;
+      }
+
+      // writable (editor/owner) → живая совместная сессия
       let file: TFile;
       try { file = await this.app.vault.create(path, ''); }
       catch (e) { new Notice('Не удалось создать заметку: ' + (e as Error).message); return; }
@@ -208,6 +221,24 @@ export default class CollabNotesPlugin extends Plugin {
       await this.saveSettings();
       new Notice('Подключено к совместной заметке');
     }).open();
+  }
+
+  // разово получить текст заметки с сервера (для read-only копии), затем отключиться
+  private fetchDocContent(docId: string, token: string): Promise<string> {
+    return new Promise((resolve) => {
+      const ydoc = new Y.Doc();
+      const provider = new WebsocketProvider(this.wsBase(), docId, ydoc, { params: { token } });
+      let done = false;
+      const finish = () => {
+        if (done) return; done = true;
+        const text = ydoc.getText('body').toString();
+        provider.destroy(); ydoc.destroy();
+        resolve(text);
+      };
+      provider.on('sync', (isSynced: boolean) => { if (isSynced) finish(); });
+      if (provider.synced) finish();
+      window.setTimeout(finish, 8000); // не ждём вечно
+    });
   }
 
   private connect(file: TFile, docId: string, token: string, seed: string | null, link: string) {
