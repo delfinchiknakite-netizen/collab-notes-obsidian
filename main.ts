@@ -1,17 +1,21 @@
 import {
   App, Plugin, PluginSettingTab, Setting, Notice, Modal, TFile, TFolder, MarkdownView, requestUrl, RequestUrlResponse,
-  SettingDefinitionItem, EventRef,
+  SettingDefinitionItem,
 } from 'obsidian';
 import { Compartment, EditorState } from '@codemirror/state';
 import { EditorView } from '@codemirror/view';
 import * as Y from 'yjs';
 import { WebsocketProvider } from 'y-websocket';
 import { yCollab } from 'y-codemirror.next';
+import { VaultSync } from './vault-sync';
+import { DocCache } from './doc-cache';
+import { canBindVault } from './sync-core';
 // @ts-ignore — без типов
 import qrcode from 'qrcode-generator';
 
-interface SharedInfo { docId: string; token: string; link: string; viewLink?: string; }
+interface SharedInfo { docId: string; token: string; link: string; viewLink?: string; server?: string; }
 interface VaultSyncSettings {
+  syncConfig?: boolean;
   enabled: boolean;
   vaultId: string;
   vaultToken: string;
@@ -22,6 +26,7 @@ interface AccountSettings {
   token: string; // сессионный токен (не пароль)
 }
 interface CollabSettings {
+  boundVault?: string;
   serviceUrl: string;
   userName: string;
   shared: Record<string, SharedInfo>; // path -> сессия (переживает перезапуск)
@@ -58,6 +63,9 @@ function applyTextToYText(ytext: Y.Text, next: string): void {
 const collab = new Compartment();
 
 interface Session {
+  cache?: DocCache;
+  writing?: boolean;
+  diskQueue?: Promise<void>;
   file: TFile;
   docId: string;
   link: string;
@@ -89,6 +97,12 @@ export default class CollabNotesPlugin extends Plugin {
   async onload() {
     await this.loadSettings();
     this.vaultSync = new VaultSync(this);
+    this.registerEvent(this.app.vault.on('modify', (file) => {
+      if (!(file instanceof TFile)) return;
+      const session = this.sessions.get(file.path);
+      if (!session || !session.synced || session.readOnly || session.writing) return;
+      void this.app.vault.read(file).then((text) => applyTextToYText(session.ytext, text)).catch((error: Error) => new Notice(error.message));
+    }));
     this.registerEditorExtension([collab.of([])]);
 
     const collabTitle = (path: string) => (this.sessions.has(path) ? 'Совместное редактирование — управление' : 'Совместное редактирование');
@@ -154,7 +168,7 @@ export default class CollabNotesPlugin extends Plugin {
     // восстановить сессии после перезапуска (переподключиться) + запустить синк vault
     this.app.workspace.onLayoutReady(() => {
       this.restoreSessions();
-      if (this.settings.vault.enabled) void this.refreshAuth().then(() => this.vaultSync.start());
+      if (this.settings.vault.enabled) void this.refreshAuth().then(() => this.vaultSync.start()).catch((error: Error) => { new Notice('Синхронизация не запущена: ' + error.message, 15000); });
     });
 
     this.addSettingTab(new CollabSettingTab(this.app, this));
@@ -163,6 +177,7 @@ export default class CollabNotesPlugin extends Plugin {
   private restoreSessions() {
     let changed = false;
     for (const [path, info] of Object.entries(this.settings.shared || {})) {
+      if (info.server && info.server !== this.settings.serviceUrl.replace(/\/$/, '')) continue;
       const file = this.app.vault.getAbstractFileByPath(path);
       if (file instanceof TFile) this.connect(file, info.docId, info.token, null, info.link);
       else { delete this.settings.shared[path]; changed = true; }
@@ -172,13 +187,14 @@ export default class CollabNotesPlugin extends Plugin {
   }
 
   onunload() {
-    this.vaultSync?.stop();
-    this.sessions.forEach((s) => s.provider.destroy());
+    void this.vaultSync?.stop().catch((error: Error) => console.error('Collab Notes shutdown:', error.message));
+    this.sessions.forEach((s) => { s.provider.destroy(); void s.cache?.close(); s.ydoc.destroy(); });
     this.sessions.clear();
   }
 
   // включить синк vault (создаёт vault-ключ, если его ещё нет)
   async enableVaultSync(): Promise<void> {
+    if (!await this.requireAccountServer()) return;
     if (!this.settings.vault.vaultId) {
       const base = this.serviceBase(); if (!base) return;
       try {
@@ -187,14 +203,39 @@ export default class CollabNotesPlugin extends Plugin {
         this.settings.vault.vaultId = v.vaultId; this.settings.vault.vaultToken = v.vaultToken; this.settings.vault.index = {};
       } catch (e) { new Notice('Не удалось создать vault: ' + (e as Error).message); return; }
     }
-    this.settings.vault.enabled = true;
-    await this.saveSettings();
-    await this.vaultSync.start();
+    const target = this.settings.serviceUrl.replace(/\/$/, '') + ':' + this.settings.vault.vaultId;
+    const nonempty = this.app.vault.getFiles().length > 0;
+    if (!canBindVault(this.settings.boundVault, target, nonempty)) {
+      new Notice('Это локальное хранилище уже привязано к другому аккаунту или серверу. Откройте отдельный пустой vault.', 15000);
+      return;
+    }
+    const enable = async () => {
+      this.settings.boundVault = target;
+      this.settings.vault.enabled = true;
+      await this.saveSettings();
+      await this.vaultSync.start();
+    };
+    await new Promise<void>((resolve) => new SyncConsentModal(this.app, this.settings.account.email || this.settings.vault.vaultId, this.app.vault.getFiles().length, enable, resolve).open());
   }
   async disableVaultSync(): Promise<void> {
     this.settings.vault.enabled = false;
     await this.saveSettings();
-    this.vaultSync.stop();
+    await this.vaultSync.stop();
+  }
+  async updateServiceUrl(value: string): Promise<void> {
+    const next = value.trim().replace(/\/$/, '');
+    const previous = this.settings.serviceUrl.replace(/\/$/, '');
+    if (next === previous) return;
+    await this.disableVaultSync();
+    for (const [path, session] of this.sessions) {
+      if (this.settings.shared[path]) this.settings.shared[path].server = previous;
+      session.provider.destroy(); await session.cache?.close(); session.ydoc.destroy();
+    }
+    this.sessions.clear(); this.refreshBinding();
+    this.settings.serviceUrl = next;
+    this.settings.account = { email: '', token: '' };
+    this.settings.vault = { enabled: false, vaultId: '', vaultToken: '', index: {} };
+    await this.saveSettings();
   }
   vaultKeyString(): string {
     return this.settings.vault.vaultId ? `${this.settings.vault.vaultId}:${this.settings.vault.vaultToken}` : '';
@@ -202,47 +243,104 @@ export default class CollabNotesPlugin extends Plugin {
 
   // ---------- аккаунты ----------
   isLoggedIn(): boolean { return !!this.settings.account.token; }
+  private async requireAccountServer(): Promise<boolean> {
+    const base = this.serviceBase(); if (!base) return false;
+    try {
+      const url = new URL(base);
+      if (url.protocol !== 'https:' && !(url.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname))) {
+        new Notice('Для аккаунтов и синхронизации нужен HTTPS. HTTP разрешён только на localhost.', 15000);
+        return false;
+      }
+      const res = await requestUrl({ url: base + '/capabilities', method: 'GET', throw: false });
+      if (res.status !== 200 || (res.json as { protocol?: number }).protocol !== 2) {
+        new Notice('Обновите сервер до версии 2.6.0 с протоколом 2 перед включением синхронизации.', 15000);
+        return false;
+      }
+      return true;
+    } catch { new Notice('Сервис недоступен или не поддерживает безопасный синк. Проверьте URL и версию сервера.', 15000); return false; }
+  }
 
   // общий обработчик ответа /auth/{register,login}: сохранить сессию + привязать vault + включить синк
   private async applyAuth(data: { userId: string; token: string; email: string; vaultId: string; vaultToken: string }): Promise<void> {
+    await this.suspendAccountSessions();
     this.settings.account = { email: data.email, token: data.token };
     // если vault сменился (другой аккаунт) — сбросить локальное зеркало манифеста
     const sameVault = this.settings.vault.vaultId === data.vaultId;
-    this.settings.vault = { enabled: true, vaultId: data.vaultId, vaultToken: data.vaultToken, index: sameVault ? this.settings.vault.index : {} };
+    await this.vaultSync.stop();
+    this.settings.vault = { enabled: false, vaultId: data.vaultId, vaultToken: data.vaultToken, index: sameVault ? this.settings.vault.index : {}, syncConfig: this.settings.vault.syncConfig };
     await this.saveSettings();
-    this.vaultSync.stop();
-    await this.vaultSync.start();
+    new Notice('Вход выполнен. Синхронизация выключена: включите её отдельно после проверки локального хранилища.', 15000);
   }
   async authRegister(email: string, password: string): Promise<void> {
+    if (!await this.requireAccountServer()) return;
     const base = this.serviceBase(); if (!base) { new Notice('Сначала укажите адрес сервера'); return; }
     const res = await requestUrl({ url: base + '/auth/register', method: 'POST', contentType: 'application/json', body: JSON.stringify({ email, password }), throw: false });
     if (res.status >= 400) { new Notice('Регистрация: ' + ((res.json as { error?: string })?.error || res.status)); return; }
-    await this.applyAuth(res.json as { userId: string; token: string; email: string; vaultId: string; vaultToken: string });
-    new Notice('Аккаунт создан, синк включён');
+    new Notice('Аккаунт создан. Подтвердите email кодом из письма, затем войдите.', 15000);
   }
   async authLogin(email: string, password: string): Promise<void> {
+    if (!await this.requireAccountServer()) return;
     const base = this.serviceBase(); if (!base) { new Notice('Сначала укажите адрес сервера'); return; }
     const res = await requestUrl({ url: base + '/auth/login', method: 'POST', contentType: 'application/json', body: JSON.stringify({ email, password }), throw: false });
     if (res.status >= 400) { new Notice('Вход: ' + ((res.json as { error?: string })?.error || res.status)); return; }
     await this.applyAuth(res.json as { userId: string; token: string; email: string; vaultId: string; vaultToken: string });
-    new Notice('Вход выполнен, синк включён');
+    new Notice('Вход выполнен');
   }
   async authLogout(): Promise<void> {
-    this.vaultSync.stop();
+    await this.suspendAccountSessions();
+    await this.vaultSync.stop();
     this.settings.account = { email: '', token: '' };
     this.settings.vault = { enabled: false, vaultId: '', vaultToken: '', index: {} };
     await this.saveSettings();
     new Notice('Вы вышли из аккаунта');
+  }
+  private async suspendAccountSessions(): Promise<void> {
+    for (const [path, session] of this.sessions) {
+      const info = this.settings.shared[path];
+      if (!info?.token.startsWith('accountvault.')) continue;
+      session.provider.destroy();
+      await session.cache?.close();
+      session.ydoc.destroy();
+      this.sessions.delete(path);
+      delete this.settings.shared[path];
+    }
+    this.refreshBinding();
+  }
+  async authAction(action: string, email: string, code = '', password = ''): Promise<void> {
+    if (!await this.requireAccountServer()) return;
+    const base = this.serviceBase(); if (!base) return;
+    try {
+      const res = await requestUrl({ url: base + '/auth/' + action, method: 'POST', contentType: 'application/json', body: JSON.stringify({ email, code, password }), throw: false });
+      const data = res.json as { message?: string; error?: string };
+      new Notice(data.error || data.message || 'Запрос выполнен', 15000);
+    } catch { new Notice('Сервис недоступен. Повторите позже'); }
   }
   // при запуске обновить vault-токен по сессии (перевыпускается, не протухает пока жив аккаунт)
   async refreshAuth(): Promise<void> {
     if (!this.settings.account.token) return;
     const base = this.serviceBase(); if (!base) return;
     try {
-      const res = await requestUrl({ url: base + '/auth/me?token=' + encodeURIComponent(this.settings.account.token), method: 'GET', throw: false });
-      if (res.status >= 400) return; // сессия истекла — попросим войти заново, локальный ключ ещё поработает
-      const d = res.json as { vaultId: string; vaultToken: string; email: string };
+      const res = await requestUrl({ url: base + '/auth/me', headers: { Authorization: 'Bearer ' + this.settings.account.token }, method: 'GET', throw: false });
+      if (res.status === 401 || res.status === 403) {
+        this.settings.vault.enabled = false;
+        await this.saveSettings();
+        new Notice('Сессия аккаунта истекла. Войдите заново', 15000);
+        return;
+      }
+      if (res.status >= 400) throw new Error('Сервис аккаунтов недоступен');
+      const d = res.json as { vaultId: string; vaultToken: string; email: string; token?: string };
       this.settings.vault.vaultId = d.vaultId; this.settings.vault.vaultToken = d.vaultToken;
+      if (d.token) this.settings.account.token = d.token;
+      for (const [path, info] of Object.entries(this.settings.shared)) {
+        if (info.token.startsWith('accountvault.') && info.docId.startsWith(d.vaultId + '.')) {
+          info.token = d.vaultToken;
+          const session = this.sessions.get(path);
+          if (session) {
+            const url = new URL(session.provider.url); url.searchParams.set('token', d.vaultToken);
+            session.provider.url = url.toString(); session.provider.disconnect(); session.provider.connect();
+          }
+        }
+      }
       this.settings.account.email = d.email;
       await this.saveSettings();
     } catch { /* офлайн — используем сохранённый токен */ }
@@ -252,7 +350,8 @@ export default class CollabNotesPlugin extends Plugin {
     if (i <= 0) return false;
     const vaultId = key.slice(0, i), vaultToken = key.slice(i + 1);
     if (!vaultId || !vaultToken) return false;
-    this.settings.vault = { enabled: true, vaultId, vaultToken, index: {} };
+    if (!/^[\w-]+$/.test(vaultId) || !/^(vault\.|accountvault\.)/.test(vaultToken)) return false;
+    this.settings.vault = { enabled: false, vaultId, vaultToken, index: {} };
     return true;
   }
 
@@ -274,6 +373,19 @@ export default class CollabNotesPlugin extends Plugin {
 
     const base = this.serviceBase();
     if (!base) return;
+    const vaultDoc = this.vaultSync.documentId(file.path);
+    if (vaultDoc) {
+      try {
+        const url = base + '/access/' + encodeURIComponent(vaultDoc) + '?token=' + encodeURIComponent(this.settings.vault.vaultToken);
+        const create = async (role: string) => (await requestUrl({ url, method: 'POST', contentType: 'application/json', body: JSON.stringify({ role, days: 30 }) })).json as { link: string };
+        const edit = await create('editor'), view = await create('viewer');
+        this.settings.shared[file.path] = { docId: vaultDoc, token: this.settings.vault.vaultToken, link: edit.link, viewLink: view.link };
+        await this.saveSettings();
+        this.connect(file, vaultDoc, this.settings.vault.vaultToken, null, edit.link);
+        new ResultModal(this.app, edit.link, undefined, view.link).open();
+      } catch { new Notice('Не удалось выдать ссылку. Проверьте подключение и аккаунт'); }
+      return;
+    }
     let res: RequestUrlResponse;
     try { res = await requestUrl({ url: base + '/sessions', method: 'POST' }); }
     catch (e) { new Notice('Не удалось создать сессию: ' + (e as Error).message); return; }
@@ -319,7 +431,8 @@ export default class CollabNotesPlugin extends Plugin {
       // read-only (viewer) ссылка → разовая КОПИЯ в vault, БЕЗ привязки к чужому vault
       if (!canWriteToken(token)) {
         let content = '';
-        try { content = await this.fetchDocContent(docId, token); } catch { /* оставим пустой */ }
+        try { content = await this.fetchDocContent(docId, token); }
+        catch { new Notice('Не удалось загрузить заметку: проверьте ссылку и подключение. Пустая копия не создана.', 15000); return; }
         let file: TFile;
         try { file = await this.app.vault.create(path, content); }
         catch (e) { new Notice('Не удалось создать заметку: ' + (e as Error).message); return; }
@@ -342,25 +455,27 @@ export default class CollabNotesPlugin extends Plugin {
 
   // разово получить текст заметки с сервера (для read-only копии), затем отключиться
   private fetchDocContent(docId: string, token: string): Promise<string> {
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
       const ydoc = new Y.Doc();
       const provider = new WebsocketProvider(this.wsBase(), docId, ydoc, { params: { token } });
       let done = false;
-      const finish = () => {
+      let timeout: number;
+      const finish = (ok: boolean) => {
         if (done) return; done = true;
+        window.clearTimeout(timeout);
         const text = ydoc.getText('body').toString();
         provider.destroy(); ydoc.destroy();
-        resolve(text);
+        if (ok) resolve(text); else reject(new Error('Не удалось загрузить заметку'));
       };
-      provider.on('sync', (isSynced: boolean) => { if (isSynced) finish(); });
-      if (provider.synced) finish();
-      window.setTimeout(finish, 8000); // не ждём вечно
+      provider.on('sync', (isSynced: boolean) => { if (isSynced) finish(true); });
+      timeout = window.setTimeout(() => finish(false), 15000);
+      if (provider.synced) finish(true);
     });
   }
 
   private connect(file: TFile, docId: string, token: string, seed: string | null, link: string) {
     const ydoc = new Y.Doc();
-    const provider = new WebsocketProvider(this.wsBase(), docId, ydoc, { params: { token } });
+    const provider = new WebsocketProvider(this.wsBase(), docId, ydoc, { params: { token }, connect: false, disableBc: true });
     const ytext = ydoc.getText('body');
 
     const name = this.settings.userName || ('Гость-' + Math.floor(Math.random() * 900 + 100));
@@ -369,20 +484,57 @@ export default class CollabNotesPlugin extends Plugin {
 
     const session: Session = { file, docId, link, ydoc, provider, ytext, synced: false, readOnly: !canWriteToken(token) };
     this.sessions.set(file.path, session);
+    let hadCache = false;
+    ytext.observe(() => {
+      if (!session.synced) return;
+      session.diskQueue = (session.diskQueue || Promise.resolve()).then(async () => {
+        if (this.sessions.get(session.file.path) !== session) return;
+        const target = ytext.toString();
+        if (await this.app.vault.read(session.file) === target) return;
+        session.writing = true;
+        try { await this.app.vault.modify(session.file, target); } finally { session.writing = false; }
+      }).catch((error: Error) => { new Notice('Ошибка записи заметки: ' + error.message); });
+    });
 
     // Привязываем yCollab ТОЛЬКО после первичной синхронизации, иначе входящий с сервера
     // текст добавится поверх уже загруженного из файла → дублирование.
+    let initializing = false;
     const onSync = (isSynced: boolean) => {
-      if (!isSynced || session.synced) return;
-      session.synced = true;
+      if (!isSynced || session.synced || initializing) return;
+      initializing = true;
       if (seed != null && ytext.length === 0) ytext.insert(0, seed); // первый участник — засеять
-      this.bindActive(session); // ytext теперь актуален → выравниваем редактор по нему и связываем
+      void (async () => {
+        const local = await this.app.vault.read(session.file);
+        if (local !== ytext.toString() && !hadCache && seed === null && local) {
+          const copy = session.file.path.replace(/\.md$/i, '') + ' (конфликт ' + crypto.randomUUID() + ').md';
+          await this.app.vault.create(copy, local);
+        }
+        session.writing = true;
+        try { await this.app.vault.modify(session.file, ytext.toString()); } finally { session.writing = false; }
+        session.synced = true;
+        this.bindActive(session);
+      })().catch((error: Error) => { initializing = false; new Notice('Ошибка совместной заметки: ' + error.message); });
     };
     provider.on('sync', onSync);
     if (provider.synced) onSync(true);
 
     provider.on('status', (e: { status: string }) => this.updateStatus(e.status === 'connected'));
     provider.awareness.on('change', () => this.updateStatus(provider.wsconnected));
+    void (async () => {
+      const opened = await DocCache.open(this.app.vault.adapter, this.app.vault.configDir + '/plugins/' + this.manifest.id + '/.collab-sync/shared', this.settings.serviceUrl + ':' + docId, ydoc,
+        (error) => new Notice('Не сохранён офлайн-кэш: ' + error.message, 15000));
+      if (this.sessions.get(file.path) !== session) { await opened.cache.close(); ydoc.destroy(); return; }
+      if (opened.loaded && !session.readOnly) {
+        hadCache = true;
+        applyTextToYText(ytext, await this.app.vault.read(session.file));
+        await opened.cache.flush();
+        session.synced = true;
+        this.bindActive(session);
+      }
+      session.cache = opened.cache;
+      if (seed !== null && !opened.loaded) { applyTextToYText(ytext, seed); await opened.cache.flush(); }
+      provider.connect();
+    })().catch((error: Error) => new Notice('Не удалось открыть совместную заметку: ' + error.message, 15000));
   }
 
   // применить имя из настроек ко всем активным сессиям «на лету»
@@ -440,7 +592,7 @@ export default class CollabNotesPlugin extends Plugin {
 
   leave(path: string) {
     const s = this.sessions.get(path);
-    if (s) { s.provider.destroy(); this.sessions.delete(path); }
+    if (s) { s.provider.destroy(); void s.cache?.close(); s.ydoc.destroy(); this.sessions.delete(path); }
     delete this.settings.shared[path];
     void this.saveSettings();
     this.refreshBinding();
@@ -470,215 +622,21 @@ export default class CollabNotesPlugin extends Plugin {
 // <vaultId>.manifest (Y.Map noteId -> {path, deleted}). Мост файл↔CRDT: правки файла уходят в
 // Y.Text минимальным диффом, правки CRDT пишутся в файл. Петли гасятся набором writing.
 // Данные не теряются: удаление → в корзину, конфликт при join → сохраняется копия.
-interface NoteConn { doc: Y.Doc; provider: WebsocketProvider; ytext: Y.Text; obs: () => void; timer: number | null; }
-class VaultSync {
-  private manifest: { doc: Y.Doc; provider: WebsocketProvider; files: Y.Map<{ path: string; deleted?: boolean }> } | null = null;
-  private notes = new Map<string, NoteConn>(); // noteId -> соединение
-  private writing = new Set<string>();          // пути, которые сейчас пишет синк (гасим watcher)
-  private refs: EventRef[] = [];
-  private ready = false;
-
-  constructor(private plugin: CollabNotesPlugin) {}
-  private get app(): App { return this.plugin.app; }
-  private get s(): VaultSyncSettings { return this.plugin.settings.vault; }
-  private wsBase(): string { return this.plugin.settings.serviceUrl.replace(/\/$/, '').replace(/^http/, 'ws') + '/ws'; }
-  private ns(noteId: string): string { return this.s.vaultId + '.' + noteId; }
-  private newId(): string { return Math.random().toString(36).slice(2, 10) + Date.now().toString(36); }
-  private pathToId(path: string): string | undefined { return Object.keys(this.s.index).find((id) => this.s.index[id] === path); }
-
-  async start(): Promise<void> {
-    if (this.manifest || !this.s.vaultId || !this.s.vaultToken || !this.plugin.settings.serviceUrl) return;
-    const doc = new Y.Doc();
-    const provider = new WebsocketProvider(this.wsBase(), this.s.vaultId + '.manifest', doc, { params: { token: this.s.vaultToken } });
-    const files = doc.getMap('files') as Y.Map<{ path: string; deleted?: boolean }>;
-    this.manifest = { doc, provider, files };
-    const onSync = (isSynced: boolean) => { if (isSynced && !this.ready) { this.ready = true; void this.reconcile(); } };
-    provider.on('sync', onSync);
-    if (provider.synced) onSync(true);
-    files.observe(() => void this.onManifestChange());
-    this.refs.push(this.app.vault.on('modify', (f) => { if (f instanceof TFile && f.extension === 'md') void this.onFileChanged(f); }));
-    this.refs.push(this.app.vault.on('create', (f) => { if (this.ready && f instanceof TFile && f.extension === 'md') void this.onFileChanged(f); }));
-    this.refs.push(this.app.vault.on('delete', (f) => { if (f instanceof TFile && f.extension === 'md') void this.onFileDeleted(f.path); }));
-    this.refs.push(this.app.vault.on('rename', (f, oldPath) => { if (f instanceof TFile && f.extension === 'md') void this.onFileRenamed(f, oldPath); }));
-    new Notice('Синхронизация хранилища включена');
+class SyncConsentModal extends Modal {
+  constructor(app: App, private account: string, private count: number, private accept: () => Promise<void>, private done: () => void) { super(app); }
+  onOpen() {
+    this.setTitle('Подключить синхронизацию?');
+    this.contentEl.createEl('p', { text: `Аккаунт/хранилище: ${this.account}. Локальных файлов: ${this.count}. Файлы этого vault будут отправлены на сервер, удалённые — загружены сюда. Для другого аккаунта используйте отдельный пустой vault. Сделайте резервную копию.` });
+    new Setting(this.contentEl)
+      .addButton((b) => b.setButtonText('Отмена').onClick(() => this.close()))
+      .addButton((b) => b.setButtonText('Подключить этот vault').setCta().onClick(() => {
+        b.setDisabled(true);
+        void this.accept().then(() => this.close()).catch((error: Error) => { new Notice(error.message); b.setDisabled(false); });
+      }));
   }
-
-  stop(): void {
-    for (const r of this.refs) this.app.vault.offref(r);
-    this.refs = [];
-    for (const [, n] of this.notes) { if (n.timer) window.clearTimeout(n.timer); n.ytext.unobserve(n.obs); n.provider.destroy(); n.doc.destroy(); }
-    this.notes.clear();
-    if (this.manifest) { this.manifest.provider.destroy(); this.manifest.doc.destroy(); this.manifest = null; }
-    this.ready = false;
-  }
-
-  // начальная сверка локальных файлов и манифеста
-  private async reconcile(): Promise<void> {
-    if (!this.manifest) return;
-    const files = this.manifest.files;
-    for (const [noteId, meta] of files) {
-      const local = this.app.vault.getAbstractFileByPath(meta.path);
-      if (meta.deleted) {
-        if (local instanceof TFile && this.s.index[noteId]) await this.trash(local);
-        delete this.s.index[noteId];
-        continue;
-      }
-      this.connectNote(noteId, meta.path);
-    }
-    const known = new Set<string>();
-    for (const [, m] of files) if (!m.deleted) known.add(m.path);
-    for (const f of this.app.vault.getMarkdownFiles()) if (!known.has(f.path)) await this.addLocalFile(f);
-    await this.plugin.saveSettings();
-  }
-
-  // добавить локальный файл в vault (создать noteId + запись в манифесте + доку)
-  private async addLocalFile(file: TFile): Promise<void> {
-    if (!this.manifest || this.pathToId(file.path)) return;
-    const noteId = this.newId();
-    this.s.index[noteId] = file.path;
-    this.manifest.files.set(noteId, { path: file.path });
-    const content = await this.app.vault.read(file);
-    this.connectNote(noteId, file.path, content);
-    await this.plugin.saveSettings();
-  }
-
-  // подключить док заметки и связать с файлом
-  private connectNote(noteId: string, path: string, seed?: string): void {
-    if (this.notes.has(noteId)) return;
-    this.s.index[noteId] = path;
-    const doc = new Y.Doc();
-    const provider = new WebsocketProvider(this.wsBase(), this.ns(noteId), doc, { params: { token: this.s.vaultToken } });
-    const ytext = doc.getText('body');
-    const conn: NoteConn = { doc, provider, ytext, obs: () => {}, timer: null };
-    conn.obs = () => this.scheduleWriteFile(noteId);
-    this.notes.set(noteId, conn);
-
-    let synced = false;
-    const onSync = (isSynced: boolean) => {
-      if (!isSynced || synced) return; synced = true;
-      void this.onNoteSynced(noteId, path, ytext, seed);
-      ytext.observe(conn.obs);
-    };
-    provider.on('sync', onSync);
-    if (provider.synced) onSync(true);
-  }
-
-  // первичная сверка содержимого дока и файла
-  private async onNoteSynced(noteId: string, path: string, ytext: Y.Text, seed?: string): Promise<void> {
-    const remote = ytext.toString();
-    const file = this.app.vault.getAbstractFileByPath(path);
-    if (ytext.length === 0) {
-      // новый док → засеять содержимым файла
-      const text = seed ?? (file instanceof TFile ? await this.app.vault.read(file) : '');
-      if (text) applyTextToYText(ytext, text);
-      if (!(file instanceof TFile)) await this.writeFile(path, text); // создать локально, если нет
-      return;
-    }
-    if (file instanceof TFile) {
-      const local = await this.app.vault.read(file);
-      if (local !== remote) {
-        // конфликт: сохраняем локальную версию копией, файл приводим к vault
-        await this.saveConflictCopy(path, local);
-        await this.writeFile(path, remote);
-      }
-    } else {
-      await this.writeFile(path, remote); // нет локально → вытянуть из vault
-    }
-  }
-
-  // файл изменён/создан → в Y.Text (мин. диффом)
-  private async onFileChanged(file: TFile): Promise<void> {
-    if (!this.ready || this.writing.has(file.path)) return;
-    let noteId = this.pathToId(file.path);
-    if (!noteId) { await this.addLocalFile(file); return; }
-    const conn = this.notes.get(noteId);
-    if (!conn) { this.connectNote(noteId, file.path); return; }
-    const text = await this.app.vault.read(file);
-    applyTextToYText(conn.ytext, text);
-  }
-
-  private async onFileDeleted(path: string): Promise<void> {
-    if (!this.ready || this.writing.has(path)) return;
-    const noteId = this.pathToId(path);
-    if (!noteId || !this.manifest) return;
-    this.manifest.files.set(noteId, { path, deleted: true });
-    const conn = this.notes.get(noteId);
-    if (conn) { if (conn.timer) window.clearTimeout(conn.timer); conn.ytext.unobserve(conn.obs); conn.provider.destroy(); conn.doc.destroy(); this.notes.delete(noteId); }
-    delete this.s.index[noteId];
-    await this.plugin.saveSettings();
-  }
-
-  private async onFileRenamed(file: TFile, oldPath: string): Promise<void> {
-    if (!this.ready) return;
-    const noteId = this.pathToId(oldPath);
-    if (!noteId || !this.manifest) { void this.onFileChanged(file); return; }
-    this.s.index[noteId] = file.path;
-    this.manifest.files.set(noteId, { path: file.path });
-    await this.plugin.saveSettings();
-  }
-
-  // манифест изменился на другом устройстве → применить создания/переименования/удаления локально
-  private async onManifestChange(): Promise<void> {
-    if (!this.ready || !this.manifest) return;
-    for (const [noteId, meta] of this.manifest.files) {
-      const knownPath = this.s.index[noteId];
-      if (meta.deleted) {
-        const f = this.app.vault.getAbstractFileByPath(meta.path);
-        if (f instanceof TFile) await this.trash(f);
-        if (knownPath) { const c = this.notes.get(noteId); if (c) { c.provider.destroy(); c.doc.destroy(); this.notes.delete(noteId); } delete this.s.index[noteId]; }
-        continue;
-      }
-      if (knownPath && knownPath !== meta.path) { // переименование с другого устройства
-        const f = this.app.vault.getAbstractFileByPath(knownPath);
-        if (f instanceof TFile) { this.writing.add(meta.path); try { await this.app.fileManager.renameFile(f, meta.path); } catch { /* конфликт имени */ } finally { window.setTimeout(() => this.writing.delete(meta.path), 500); } }
-        this.s.index[noteId] = meta.path;
-      } else if (!knownPath) { // новая заметка с другого устройства
-        this.connectNote(noteId, meta.path);
-      }
-    }
-    await this.plugin.saveSettings();
-  }
-
-  // записать Y.Text заметки в файл (дебаунс)
-  private scheduleWriteFile(noteId: string): void {
-    const conn = this.notes.get(noteId);
-    if (!conn) return;
-    if (conn.timer) window.clearTimeout(conn.timer);
-    conn.timer = window.setTimeout(() => { void this.writeFile(this.s.index[noteId], conn.ytext.toString()); }, 250);
-  }
-
-  private async writeFile(path: string, text: string): Promise<void> {
-    if (!path) return;
-    this.writing.add(path);
-    try {
-      const f = this.app.vault.getAbstractFileByPath(path);
-      if (f instanceof TFile) { if ((await this.app.vault.read(f)) !== text) await this.app.vault.modify(f, text); }
-      else { await this.ensureFolder(path); await this.app.vault.create(path, text); }
-    } catch (e) { /* ignore */ }
-    finally { window.setTimeout(() => this.writing.delete(path), 500); }
-  }
-
-  private async ensureFolder(path: string): Promise<void> {
-    const dir = path.split('/').slice(0, -1).join('/');
-    if (dir && !this.app.vault.getAbstractFileByPath(dir)) { try { await this.app.vault.createFolder(dir); } catch { /* уже есть */ } }
-  }
-
-  private async saveConflictCopy(path: string, content: string): Promise<void> {
-    const base = path.replace(/\.md$/i, '');
-    const cp = `${base} (конфликт ${new Date().toISOString().slice(0, 10)}).md`;
-    this.writing.add(cp);
-    try { if (!this.app.vault.getAbstractFileByPath(cp)) await this.app.vault.create(cp, content); } catch { /* ignore */ }
-    finally { window.setTimeout(() => this.writing.delete(cp), 500); }
-  }
-
-  private async trash(file: TFile): Promise<void> {
-    this.writing.add(file.path);
-    try { await this.app.vault.trash(file, false); } catch { /* ignore */ }
-    finally { window.setTimeout(() => this.writing.delete(file.path), 500); }
-  }
+  onClose() { this.contentEl.empty(); this.done(); }
 }
 
-// Форма-результат (как в yc-pages): ссылка + копирование + QR + открыть/закрыть
 class ResultModal extends Modal {
   constructor(app: App, private link: string, private onLeave?: () => void, private viewLink?: string) { super(app); }
   onOpen() {
@@ -808,6 +766,7 @@ class CollabSettingTab extends PluginSettingTab {
 
   async setControlValue(key: string, value: unknown): Promise<void> {
     const v = typeof value === 'string' ? value.trim() : value;
+    if (key === 'serviceUrl' && typeof v === 'string') { await this.plugin.updateServiceUrl(v); return; }
     (this.plugin.settings as unknown as Record<string, unknown>)[key] = v;
     await this.plugin.saveSettings();
     if (key === 'userName') this.plugin.applyUserName();
@@ -822,10 +781,14 @@ class CollabSettingTab extends PluginSettingTab {
     intro.createEl('a', { text: 'README', attr: { href: 'https://github.com/delfinchiknakite-netizen/collab-notes-obsidian#self-hosting-the-server' } });
     intro.appendText('.');
 
+    let serviceInput = this.plugin.settings.serviceUrl;
     new Setting(containerEl).setName('URL сервиса')
       .setDesc('Адрес вашего collab-сервиса (https рекомендуется). Без него шаринг недоступен.')
       .addText((t) => t.setPlaceholder('https://collab.example.com').setValue(this.plugin.settings.serviceUrl)
-        .onChange(async (v) => { this.plugin.settings.serviceUrl = v.trim(); await this.plugin.saveSettings(); }));
+        .onChange((v) => { serviceInput = v.trim(); }))
+      .addButton((b) => b.setButtonText('Применить URL').onClick(() => {
+        void this.plugin.updateServiceUrl(serviceInput).then(() => this.display()).catch((error: Error) => { new Notice(error.message); });
+      }));
     new Setting(containerEl).setName('Ваше имя').setDesc('Отображается у вашего курсора для других участников')
       .addText((t) => t.setPlaceholder('Имя').setValue(this.plugin.settings.userName)
         .onChange(async (v) => {
@@ -838,25 +801,34 @@ class CollabSettingTab extends PluginSettingTab {
     new Setting(containerEl).setName('Аккаунт').setHeading();
     if (this.plugin.isLoggedIn()) {
       new Setting(containerEl).setName('Вы вошли')
-        .setDesc(this.plugin.settings.account.email + ' — ваше хранилище синхронизируется. Войдите этим же аккаунтом на другом устройстве, чтобы получить те же заметки.')
+        .setDesc(this.plugin.settings.account.email + ' — синхронизация включается отдельно ниже. Для разных аккаунтов используйте разные локальные vault.')
         .addButton((b) => b.setButtonText('Выйти').onClick(async () => { await this.plugin.authLogout(); this.display(); }));
     } else {
       const acctDesc = containerEl.createEl('p', { cls: 'setting-item-description' });
-      acctDesc.appendText('Войдите или зарегистрируйтесь — сервис привяжет ваше хранилище к аккаунту. На любом устройстве войдите тем же email/паролем, и заметки синхронизируются автоматически (без ручного копирования ключа).');
-      let em = '', pw = '';
+      acctDesc.appendText('После регистрации подтвердите email кодом из письма. Вход не включает синхронизацию автоматически. На другом устройстве войдите тем же аккаунтом в отдельном пустом vault.');
+      let em = '', pw = '', code = '';
       new Setting(containerEl).setName('Email')
         .addText((t) => { t.setPlaceholder('you@example.com').inputEl.type = 'email'; t.onChange((val) => { em = val.trim(); }); });
-      new Setting(containerEl).setName('Пароль').setDesc('Минимум 6 символов.')
+      new Setting(containerEl).setName('Пароль').setDesc('Для регистрации и сброса — минимум 12 символов.')
         .addText((t) => { t.inputEl.type = 'password'; t.setPlaceholder('••••••'); t.onChange((val) => { pw = val; }); });
       new Setting(containerEl)
         .addButton((b) => b.setButtonText('Войти').setCta().onClick(async () => { await this.plugin.authLogin(em, pw); this.display(); }))
         .addButton((b) => b.setButtonText('Регистрация').onClick(async () => { await this.plugin.authRegister(em, pw); this.display(); }));
+      new Setting(containerEl).setName('Код из письма').addText((t) => t.onChange((value) => { code = value.trim(); }));
+      new Setting(containerEl)
+        .addButton((b) => b.setButtonText('Подтвердить email').onClick(() => void this.plugin.authAction('verify', em, code)))
+        .addButton((b) => b.setButtonText('Повторить письмо').onClick(() => void this.plugin.authAction('resend-verification', em)))
+        .addButton((b) => b.setButtonText('Восстановить пароль').onClick(() => void this.plugin.authAction('forgot-password', em)))
+        .addButton((b) => b.setButtonText('Сменить пароль по коду').onClick(() => void this.plugin.authAction('reset-password', em, code, pw)));
     }
 
     // ---- синхронизация хранилища ----
     new Setting(containerEl).setName('Синхронизация хранилища (beta)').setHeading();
     const warn = containerEl.createEl('p', { cls: 'setting-item-description' });
-    warn.appendText('Синхронизирует все .md-заметки между устройствами через ваш сервер. ⚠️ Бета — сделайте резервную копию хранилища. Вложения (картинки и т.п.) пока не синхронизируются. Данные не удаляются безвозвратно (в корзину), конфликты сохраняются копией.');
+    warn.appendText('Заметки, вложения, Canvas и Bases синхронизируются. Настройки, темы и код плагинов — по отдельному согласию. Конфликтующие вложения сохраняются отдельными копиями; удаления — в корзину. Файлы больше 20 MiB пропускаются с уведомлением. Сделайте резервную копию.');
+    new Setting(containerEl).setName('Настройки, темы и плагины')
+      .setDesc('Синхронизирует .obsidian, кроме workspace, кэша, данных плагинов и самого Collab Notes. Код плагинов может выполняться на другом устройстве. После получения настроек перезапустите Obsidian. Выключите синк перед изменением опции.')
+      .addToggle((toggle) => toggle.setValue(!!this.plugin.settings.vault.syncConfig).setDisabled(this.plugin.settings.vault.enabled).onChange(async (value) => { this.plugin.settings.vault.syncConfig = value; await this.plugin.saveSettings(); }));
 
     const v = this.plugin.settings.vault;
     if (!v.enabled) {
@@ -869,10 +841,10 @@ class CollabSettingTab extends PluginSettingTab {
         .addText((t) => { t.setPlaceholder('vaultId:token'); t.onChange((val) => { keyInput = val.trim(); }); })
         .addButton((b) => b.setButtonText('Подключить').onClick(async () => {
           if (!this.plugin.setVaultKey(keyInput)) { new Notice('Неверный ключ (формат vaultId:token)'); return; }
-          await this.plugin.saveSettings(); await this.plugin.vaultSync.start(); this.display();
+          await this.plugin.saveSettings(); await this.plugin.enableVaultSync(); this.display();
         }));
     } else {
-      new Setting(containerEl).setName('Синхронизация включена').setDesc('Заметок в индексе: ' + Object.keys(v.index).length)
+      new Setting(containerEl).setName('Синхронизация включена').setDesc('Файлов в активном индексе: ' + this.plugin.vaultSync.fileCount())
         .addButton((b) => b.setButtonText('Выключить').onClick(async () => { await this.plugin.disableVaultSync(); this.display(); }));
       new Setting(containerEl).setName('Ключ хранилища')
         .setDesc('Скопируйте на другое устройство (Подключить к существующему), чтобы синхронизировать тот же vault. Держите ключ в секрете.')

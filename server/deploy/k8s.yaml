@@ -1,0 +1,97 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: collab
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: redis, namespace: collab, labels: { app: redis } }
+spec:
+  strategy: { type: Recreate }
+  replicas: 1
+  selector: { matchLabels: { app: redis } }
+  template:
+    metadata: { labels: { app: redis } }
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          args: ["--protected-mode", "no", "--maxmemory", "256mb", "--maxmemory-policy", "noeviction", "--appendonly", "yes", "--appendfsync", "always", "--dir", "/data"]
+          volumeMounts:
+            - { name: redis-data, mountPath: /data }
+          ports: [ { containerPort: 6379 } ]
+          resources:
+            requests: { cpu: 25m, memory: 64Mi }
+            limits: { cpu: 500m, memory: 320Mi }
+      volumes:
+        - name: redis-data
+          persistentVolumeClaim: { claimName: collab-redis }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: redis, namespace: collab }
+spec:
+  selector: { app: redis }
+  ports: [ { port: 6379, targetPort: 6379 } ]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: collab, namespace: collab, labels: { app: collab } }
+spec:
+  strategy: { type: Recreate }
+  replicas: 1
+  selector: { matchLabels: { app: collab } }
+  template:
+    metadata:
+      labels: { app: collab }
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9091"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+        - name: collab
+          image: cr.yandex/crp2ssdjqlmvih5cgc2o/collab:2.6.0
+          ports:
+            - { containerPort: 80, name: http }
+            - { containerPort: 9091, name: metrics }
+          env:
+            - { name: NODE_ENV, value: production }
+            - { name: ACCOUNT_DIR, value: /data/accounts }
+            - { name: TRUST_PROXY, value: "1" }
+            - { name: MAIL_API_URL, valueFrom: { secretKeyRef: { name: collab-mail, key: url, optional: true } } }
+            - { name: MAIL_API_TOKEN, valueFrom: { secretKeyRef: { name: collab-mail, key: token, optional: true } } }
+            - { name: MAIL_FROM, valueFrom: { secretKeyRef: { name: collab-mail, key: from, optional: true } } }
+            - { name: PUBLIC_BASE, value: "https://collab.av-tarasov.ru" }
+            - { name: REDIS_URL, value: "redis://redis.collab.svc.cluster.local:6379" }
+            - { name: S3_ENDPOINT, value: "https://storage.yandexcloud.net" }
+            - { name: S3_REGION, value: "ru-central1" }
+            - { name: LINK_SECRET, valueFrom: { secretKeyRef: { name: collab-secrets, key: LINK_SECRET } } }
+            - { name: S3_ACCESS_KEY, valueFrom: { secretKeyRef: { name: collab-secrets, key: S3_ACCESS_KEY } } }
+            - { name: S3_SECRET_KEY, valueFrom: { secretKeyRef: { name: collab-secrets, key: S3_SECRET_KEY } } }
+            - { name: S3_BUCKET, valueFrom: { secretKeyRef: { name: collab-secrets, key: S3_BUCKET } } }
+          volumeMounts:
+            - { name: account-data, mountPath: /data }
+          readinessProbe:
+            httpGet: { path: /healthz, port: 80 }
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /healthz, port: 80 }
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits: { cpu: "1", memory: 512Mi }
+      volumes:
+        - name: account-data
+          persistentVolumeClaim: { claimName: collab-accounts }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: collab, namespace: collab, labels: { app: collab } }
+spec:
+  type: ClusterIP
+  selector: { app: collab }
+  ports:
+    - { name: http, port: 80, targetPort: 80 }

@@ -1,117 +1,90 @@
 # Collab Notes
 
-Real-time collaborative markdown editing in Obsidian with **live participant cursors** — like Google Docs, but for your notes. Powered by a CRDT (Yjs) over a self-hosted service, so two or more people can edit the same note simultaneously and see each other's carets and selections.
-
-Works on **desktop and mobile**.
-
-> **This plugin has no default/bundled server.** You run your own collab server (a small Node service, included in [`server/`](server/)) and point the plugin at it. Nothing is sent anywhere until you configure a server URL.
-
----
+Self-hosted collaborative Markdown editing and vault synchronization for Obsidian desktop and mobile. Plugin version: **1.0.4**. No default server, analytics, billing or E2E encryption.
 
 ## Features
 
-- **Real-time editing + cursors** — see other participants' carets and selections with their names.
-- **Right-click a note** (or the “•••” menu) → **Collaborative editing** → get a link + QR to send to a partner.
-- **Right-click a folder** → **Create a collaborative note from a link** (like “New Kanban board”).
-- Your partner adds the note to their own Obsidian with this plugin (or opens the link in a browser, if you also host the browser client).
-- **Sessions survive restarts**: list of shared notes, auto-reconnect, detach a note.
-- Access to a shared note is **only via the signed link**.
+- Shared notes with participant names, cursors and selections, using Yjs and CodeMirror 6.
+- Right-click a note or use its three-dot menu to share or manage it. Right-click a folder to import a link.
+- Owner, editor and viewer capabilities with expiration. Reader links open read-only in the browser; importing one into Obsidian creates an independent local copy.
+- Email/password accounts, email verification, password recovery and per-account vault namespaces.
+- Explicit vault connection consent. Login does not start uploading files. A nonempty vault already bound to another account/server cannot be rebound; use a separate empty local vault.
+- Markdown sync with a persistent local CRDT cache for offline/restart recovery.
+- Binary attachments, Canvas, Bases and other nonhidden files. Concurrent binary edits preserve both branches as separate files, rather than guessing a merge.
+- Optional configuration, theme and plugin-code sync. `.git`, trash, caches, workspace state, Collab Notes itself and plugin `data.json` files are excluded. Plugin data is excluded because it can contain credentials. Installing executable plugins from another device requires trusting that device.
+- Recoverable deletions, folder/file renames, unique conflict copies and visible write errors.
+- Server-side version snapshots and browser version history when S3 is configured.
 
-## Setup
+## Server setup
 
-### 1. Run the server
-The plugin needs a collab server. A minimal one is in [`server/`](server/):
+The complete server and React browser client are in [server/](server/). The former minimal in-memory relay has been replaced; it did not implement accounts, durable storage or vault sync.
 
-```bash
-cd server
-npm install
-LINK_SECRET="<any-long-random-string>" \
-PUBLIC_BASE="https://collab.example.com" \
-PORT=3000 \
-npm start
-```
+See [server/README.md](server/README.md) for local setup, Docker, email delivery, persistence, backups and the upgrade procedure. Use Node.js 20 or later. For a real deployment use HTTPS/WSS, persistent account and Redis volumes, and private S3 storage.
 
-Or with Docker:
-```bash
-cd server
-docker build -t collab-server .
-docker run -p 3000:3000 \
-  -e LINK_SECRET="<any-long-random-string>" \
-  -e PUBLIC_BASE="https://collab.example.com" \
-  collab-server
-```
+## Connect Obsidian
 
-Environment variables:
-- `LINK_SECRET` — **required**. Secret used to sign share links (any long random string). Keep it private.
-- `PUBLIC_BASE` — public base URL that share links use (e.g. `https://collab.example.com`). Defaults to `http://localhost:PORT`.
-- `PORT` — port to listen on (default `3000`).
+1. Configure **Service URL** with the API/WebSocket origin, not a static-only CDN address. For split hosting the browser build needs its own `VITE_API_BASE`.
+2. Set your display name.
+3. Register with a password of at least 12 characters. Enter the verification code from your email and confirm it. Then log in.
+4. Back up your local vault. Enable sync separately and confirm the displayed account and number of local files.
+5. On a second device, create a separate empty local vault, install the plugin, and log in with the same account. Enable sync explicitly.
+6. Configuration/theme/plugin-code synchronization is opt-in and can only be changed while sync is disabled. Restart Obsidian after receiving configuration or executable plugin changes.
 
-Put the server behind HTTPS (a reverse proxy such as Caddy/nginx/Traefik) so links work in mobile and in-app browsers. The endpoints it exposes:
-- `POST /sessions` → creates a session, returns `{ docId, token, link }`.
-- `GET /ws/<docId>?token=…` → Yjs WebSocket relay (rejects invalid/expired tokens).
-- `GET /healthz` → `ok`.
+The key-based flow remains available for standalone vaults. Keys and edit links are bearer capabilities: anyone holding one has its permissions. Do not post them publicly.
 
-### 2. Point the plugin at your server
-Settings → **Collab Notes** → **Service URL** = your server's public URL (e.g. `https://collab.example.com`). Set **Your name** too. Done — now you can share notes.
+## Offline and conflict behavior
 
-## Network use (disclosure)
+For previously synchronized Markdown, local Yjs state is loaded before network connection. File changes are applied to that state before exchanging updates, so offline insertions are merged instead of blindly replacing the remote text.
 
-This plugin only talks to **the server you configure** (there is no default). It uses the network for:
-- **HTTPS** `POST /sessions` to create a session and get a shareable link.
-- **WebSocket** to sync document edits and cursor presence in real time.
+On first import, unrelated local content at the same path is preserved in a uniquely named conflict copy. Concurrent binary branches and independent same-name creations also retain separate copies. Deletions go to the local trash. CRDT convergence does not guarantee that simultaneous edits make semantic sense.
 
-No analytics or telemetry. Only the note content you explicitly share is transmitted, and only to your configured server.
+The local cache is stored in the plugin directory under `.collab-sync/`, scoped by server and vault ID. Do not delete or Git-sync it between devices; it is local state, not a portable backup. Do not run another file-sync tool over the same vault during testing. The cache and server content are plaintext, not E2E encrypted.
 
-## How it works
+## Network and storage disclosure
 
-- **[Yjs](https://github.com/yjs/yjs)** (CRDT) — edits merge without conflicts; the server is a thin relay.
-- **CodeMirror 6** (the same editor Obsidian uses) + `y-codemirror.next` renders remote cursors out of the box.
-- Access is a capability token embedded in the link (HMAC-SHA256), verified by the server on WebSocket upgrade.
-- The plugin attaches `yCollab` to the active editor via a CM6 `Compartment`, only after the initial sync (to avoid duplicating text).
+Only the configured service is contacted. Explicit sharing uploads the selected note. Enabling vault sync uploads included files; this is broader than sharing one note. Configuration/plugin-code sync uploads additional files only when enabled. Registration and recovery send the email address and password or recovery code to the configured service; passwords are stored as salted scrypt hashes. Email delivery uses the administrator's configured provider.
+
+Notes, attachments, document history, account information and local CRDT caches consume storage. Expiring a link does not delete its content. There is no automatic content TTL. The server keeps up to 30 version snapshots per document; account backups need a separate retention policy.
 
 ## Installation
 
-### Community plugins
-Once approved: Settings → Community plugins → Browse → search **Collab Notes** → Install → Enable → then do **Setup** above.
+BRAT repository:
 
-### Beta via BRAT
-Install **BRAT**, then *Add a beta plugin* with:
-```
+```text
 https://github.com/delfinchiknakite-netizen/collab-notes-obsidian
 ```
 
-## Usage
+The manifest stays at **1.0.4** by request. Replacing assets under the same version does not reliably trigger automatic updates: use BRAT's manual reinstall/update after a release has actually been published. A local build is not a published release.
 
-1. Open a note → **right-click** (or the “•••” menu) → **Collaborative editing**.
-2. Copy the link / show the QR → send it to a partner.
-3. Partner adds it to their Obsidian: command **Add a collaborative note by link**, or **right-click a folder → Create a collaborative note from a link**.
-4. Manage: right-clicking an already-shared note shows a management form (copy link / detach). List everything with the command **Show collaborative notes**.
+The release workflow can be started manually with tag `1.0.4` to rebuild and replace the assets without force-moving the Git tag. It runs the plugin and full server tests before publication.
 
-## Settings
+For official installation, use Community Plugins once the submission has been approved.
 
-- **Service URL** — address of your collab server (required; no default).
-- **Your name** — shown at your cursor to other participants (applied live).
+## Build and test
 
-## Building from source
-
-```bash
-npm install
-npm run build   # → main.js
+```sh
+npm ci
+npm run typecheck
+npm test
+npm run build
 ```
+
+Copy `main.js`, `manifest.json` and `styles.css` to the plugin directory of a test vault. Restart or reload the plugin. Do not overwrite `data.json`.
+
+The automated file-sync suite uses a simulated Yjs transport and filesystem. The server suite runs real local HTTP/WebSocket clients and filesystem persistence. Neither replaces desktop/mobile acceptance testing; see [test/ACCEPTANCE.md](test/ACCEPTANCE.md).
+
+## Current boundaries
+
+- Maximum individual synchronized file size is 20 MiB; larger files are skipped with an error notification.
+- One connection per active document; large vaults need load testing before use.
+- Hidden application data outside the Obsidian configuration directory is excluded. Empty folders are recreated only when needed by a file.
+- Plugin credential/settings `data.json` files and Collab Notes itself are deliberately not synchronized.
+- Foreign live-shared notes and legacy standalone shared sessions remain separate from personal vault sync. An owned note shared after vault sync is enabled uses its existing vault document, not a fork. Import older standalone links explicitly on another device.
+- Email delivery must be configured; registration/recovery fail explicitly if it is absent.
+- Account file storage assumes one server process/replica. Do not horizontally scale it against the same JSON file.
+- Existing account users must confirm email and log in again after migration. Old account-bound vault keys are invalidated.
+- No E2E encryption or billing.
 
 ## License
 
 [MIT](LICENSE).
-
----
-
-## По-русски
-
-Совместное редактирование markdown-заметок в Obsidian в реальном времени с **живыми курсорами участников** — как в Google Docs. Работает на десктопе и телефоне.
-
-**Дефолтного сервера нет** — вы разворачиваете свой (минимальный сервер лежит в [`server/`](server/)) и указываете его адрес в настройках. Настройка:
-1. Запустите сервер: `cd server && npm install && LINK_SECRET="<секрет>" PUBLIC_BASE="https://collab.example.com" npm start` (или через Docker). Спрячьте за HTTPS.
-2. Settings → Collab Notes → **URL сервиса** = адрес вашего сервера, задайте **имя**.
-3. ПКМ по заметке → «Совместное редактирование» → отправьте ссылку. ПКМ по папке → «Создать совместную заметку из ссылки».
-
-Переменные сервера: `LINK_SECRET` (обязательно), `PUBLIC_BASE`, `PORT`. Сетевой доступ — только к вашему серверу: `POST /sessions` (создать сессию) + WebSocket (синхронизация). Телеметрии нет.

@@ -1,6 +1,12 @@
 name: Release Obsidian plugin
 
 on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag
+        required: true
+        default: "1.0.4"
   push:
     tags:
       - "*"
@@ -21,7 +27,9 @@ jobs:
       - name: Install deps
         run: npm ci
       - name: Build
-        run: npm run build
+        run: npm run typecheck && npm test && npm run build
+      - name: Test full server
+        run: npm ci --prefix server && npm test --prefix server && npm run build --prefix server
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v2
         with:
@@ -29,7 +37,7 @@ jobs:
       - name: Publish release assets
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           gh release create "$TAG" main.js manifest.json styles.css \
             --title "$TAG" --notes "Collab Notes $TAG" \
