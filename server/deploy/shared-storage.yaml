@@ -1,0 +1,31 @@
+apiVersion: v1
+kind: PersistentVolume
+metadata: { name: collab-tgvault-shared }
+spec:
+  capacity: { storage: 100Gi }
+  volumeMode: Filesystem
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  claimRef: { namespace: collab, name: collab-shared }
+  csi:
+    driver: disk-csi-driver.mks.ycloud.io
+    volumeHandle: fhm01qn7ip2djk40fhd2
+    fsType: ext4
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: failure-domain.beta.kubernetes.io/zone
+              operator: In
+              values: [ru-central1-a]
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: collab-shared, namespace: collab }
+spec:
+  storageClassName: ""
+  volumeName: collab-tgvault-shared
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests: { storage: 5Gi }

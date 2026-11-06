@@ -19,7 +19,7 @@ spec:
                   topologyKey: kubernetes.io/hostname
           containers:
             - name: backup
-              image: cr.yandex/crp2ssdjqlmvih5cgc2o/collab:2.6.0
+              image: cr.yandex/crp2ssdjqlmvih5cgc2o/collab:2.6.0@sha256:3b6e90b6966124a9f7aad9d7f9f3ce10769d74417aa73c10832b9ccf4ab06e37
               command: [node, backup.mjs]
               resources:
                 requests: { cpu: 10m, memory: 64Mi }
@@ -31,7 +31,7 @@ spec:
                 - { name: S3_ACCESS_KEY, valueFrom: { secretKeyRef: { name: collab-secrets, key: S3_ACCESS_KEY } } }
                 - { name: S3_SECRET_KEY, valueFrom: { secretKeyRef: { name: collab-secrets, key: S3_SECRET_KEY } } }
               volumeMounts:
-                - { name: data, mountPath: /data, readOnly: true }
+                - { name: data, mountPath: /data, subPath: collab-notes/app, readOnly: true }
           volumes:
             - name: data
-              persistentVolumeClaim: { claimName: collab-accounts }
+              persistentVolumeClaim: { claimName: collab-shared }

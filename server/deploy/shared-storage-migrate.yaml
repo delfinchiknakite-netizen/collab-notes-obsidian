@@ -1,0 +1,47 @@
+apiVersion: batch/v1
+kind: Job
+metadata: { name: collab-shared-migrate-20261106, namespace: collab }
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      containers:
+        - name: migrate
+          image: cr.yandex/crp2ssdjqlmvih5cgc2o/collab:2.6.0@sha256:3b6e90b6966124a9f7aad9d7f9f3ce10769d74417aa73c10832b9ccf4ab06e37
+          command:
+            - node
+            - --input-type=module
+            - -e
+            - |
+              import fs from 'node:fs';
+              import path from 'node:path';
+              import crypto from 'node:crypto';
+              const target='/target/collab-notes';
+              const stage='/target/collab-notes.staging-20261106';
+              if(fs.existsSync(target)||fs.existsSync(stage))throw new Error('Destination already exists');
+              const stats=fs.statfsSync('/target');
+              if(stats.bavail*stats.bsize<5*1024**3)throw new Error('Not enough free space');
+              fs.mkdirSync(stage,{mode:0o700});
+              async function hash(file){const sum=crypto.createHash('sha256');for await(const bytes of fs.createReadStream(file))sum.update(bytes);return sum.digest('hex');}
+              let count=0;
+              async function verify(source,destination){for(const entry of fs.readdirSync(source,{withFileTypes:true})){const from=path.join(source,entry.name),to=path.join(destination,entry.name);if(entry.isDirectory())await verify(from,to);else if(entry.isFile()){if(await hash(from)!==await hash(to))throw new Error('Checksum mismatch');count++;}else throw new Error('Unsupported file type');}}
+              for(const [source,name] of [['/accounts-source','app'],['/redis-source','redis']]){const to=path.join(stage,name);fs.cpSync(source,to,{recursive:true,errorOnExist:true,force:false});await verify(source,to);}
+              fs.writeFileSync(path.join(stage,'migration.json'),JSON.stringify({verifiedFiles:count,completedAt:new Date().toISOString()}),{mode:0o600});
+              fs.renameSync(stage,target);
+              console.log(JSON.stringify({verified:true,copiedFiles:count}));
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { cpu: 500m, memory: 512Mi }
+          volumeMounts:
+            - { name: accounts, mountPath: /accounts-source, readOnly: true }
+            - { name: redis, mountPath: /redis-source, readOnly: true }
+            - { name: target, mountPath: /target }
+      volumes:
+        - name: accounts
+          persistentVolumeClaim: { claimName: collab-accounts, readOnly: true }
+        - name: redis
+          persistentVolumeClaim: { claimName: collab-redis, readOnly: true }
+        - name: target
+          persistentVolumeClaim: { claimName: collab-shared }

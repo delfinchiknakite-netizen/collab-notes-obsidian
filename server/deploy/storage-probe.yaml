@@ -1,0 +1,25 @@
+apiVersion: v1
+kind: Pod
+metadata: { name: collab-storage-probe, namespace: tgvault }
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  containers:
+    - name: probe
+      image: cr.yandex/crp2ssdjqlmvih5cgc2o/collab:2.6.0@sha256:3b6e90b6966124a9f7aad9d7f9f3ce10769d74417aa73c10832b9ccf4ab06e37
+      command:
+        - node
+        - -e
+        - const fs=require('fs');const s=fs.statfsSync('/inspect');console.log(JSON.stringify({freeBytes:s.bavail*s.bsize,totalBytes:s.blocks*s.bsize,targetExists:fs.existsSync('/inspect/collab-notes')}));
+      securityContext:
+        readOnlyRootFilesystem: true
+        allowPrivilegeEscalation: false
+        capabilities: { drop: [ALL] }
+      resources:
+        requests: { cpu: 5m, memory: 32Mi }
+        limits: { cpu: 100m, memory: 128Mi }
+      volumeMounts:
+        - { name: existing, mountPath: /inspect, readOnly: true }
+  volumes:
+    - name: existing
+      persistentVolumeClaim: { claimName: tgvault-session, readOnly: true }

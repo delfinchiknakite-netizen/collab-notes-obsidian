@@ -26,6 +26,7 @@ export class AccountStore {
       this.users = JSON.parse(await readFile(this.file, "utf8"));
     } catch (error) {
       if (error.code !== "ENOENT") throw error;
+      await this.transaction(async () => {});
     }
     if (!this.users || Array.isArray(this.users) || typeof this.users !== "object") throw new Error("Invalid account store");
     for (const [email, user] of Object.entries(this.users)) {

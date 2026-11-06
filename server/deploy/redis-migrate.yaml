@@ -1,0 +1,33 @@
+apiVersion: batch/v1
+kind: Job
+metadata: { name: collab-redis-migrate-20261104, namespace: collab }
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: migrate
+          image: redis:7-alpine
+          command:
+            - sh
+            - -ec
+            - |
+              test ! -e /data/appendonlydir/appendonly.aof.manifest
+              redis-cli -h redis --rdb /data/dump.rdb
+              redis-check-rdb /data/dump.rdb
+              redis-server --port 6380 --dir /data --appendonly no --daemonize yes
+              redis-cli -p 6380 CONFIG SET appendonly yes
+              sleep 2
+              until redis-cli -p 6380 INFO persistence | tr -d '\r' | grep -q '^aof_rewrite_in_progress:0$'; do sleep 1; done
+              redis-cli -p 6380 INFO persistence | tr -d '\r' | grep -q '^aof_last_bgrewrite_status:ok$'
+              redis-cli -p 6380 DBSIZE
+              redis-cli -p 6380 SHUTDOWN SAVE
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { cpu: 500m, memory: 512Mi }
+          volumeMounts:
+            - { name: redis-data, mountPath: /data }
+      volumes:
+        - name: redis-data
+          persistentVolumeClaim: { claimName: collab-redis }

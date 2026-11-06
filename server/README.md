@@ -70,7 +70,11 @@ Do not restart the old Redis before migration: it had no persistent volume.
 
 The Kubernetes templates in the application repository are prepared configuration, not evidence that this migration has run. Do not apply all templates in a single command against an old deployment.
 
-Copies are included in [deploy/](deploy/): `storage.yaml`, `k8s.yaml`, `account-backup.yaml`, `network-policy.yaml`. Supply the image you actually built, verify the cluster's default StorageClass and ingress/monitoring namespace labels, and provision runtime secrets separately. The templates reference secret names, never secret values. New installations also need TLS ingress and DNS configured for their own domain.
+Copies are included in [deploy/](deploy/). The current deployment uses `shared-storage.yaml` and an existing TGVault disk, not newly provisioned storage. `k8s.yaml` and `account-backup.yaml` mount only `collab-notes/redis` and `collab-notes/app` through the `collab-shared` claim. Historical TGVault files remain outside these directories. Both the original PV and the static alias must retain the disk (`Retain`); never delete the original TGVault disk or run the two applications against the same data directories. The alias is bound to this installation's disk ID and zone: replace those values for another installation. Do not mount this disk from another node concurrently.
+
+`shared-storage-migrate.yaml` is a one-time, offline copy from the former SSD claims. Stop both application and Redis before running it. It refuses an existing destination, verifies copied file hashes and atomically installs the separate directory. Keep source claims until service and persistence checks pass. `storage.yaml` is only an optional provisioning alternative that creates paid SSDs; it is not part of the current deployment and its claim names do not match the shared-storage configuration.
+
+Supply the image you actually built, verify ingress/monitoring namespace labels, and provision runtime secrets separately. The templates reference secret names, never secret values. New installations also need TLS ingress and DNS configured for their own domain. The account backup CronJob writes to the existing private S3 bucket; those objects and requests still have usage-based costs. Reusing a disk does not establish a monthly cloud bill guarantee.
 
 ## API
 

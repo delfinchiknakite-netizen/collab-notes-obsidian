@@ -18,14 +18,14 @@ spec:
           image: redis:7-alpine
           args: ["--protected-mode", "no", "--maxmemory", "256mb", "--maxmemory-policy", "noeviction", "--appendonly", "yes", "--appendfsync", "always", "--dir", "/data"]
           volumeMounts:
-            - { name: redis-data, mountPath: /data }
+            - { name: redis-data, mountPath: /data, subPath: collab-notes/redis }
           ports: [ { containerPort: 6379 } ]
           resources:
             requests: { cpu: 25m, memory: 64Mi }
             limits: { cpu: 500m, memory: 320Mi }
       volumes:
         - name: redis-data
-          persistentVolumeClaim: { claimName: collab-redis }
+          persistentVolumeClaim: { claimName: collab-shared }
 ---
 apiVersion: v1
 kind: Service
@@ -51,7 +51,7 @@ spec:
     spec:
       containers:
         - name: collab
-          image: cr.yandex/crp2ssdjqlmvih5cgc2o/collab:2.6.0
+          image: cr.yandex/crp2ssdjqlmvih5cgc2o/collab:2.6.0@sha256:3b6e90b6966124a9f7aad9d7f9f3ce10769d74417aa73c10832b9ccf4ab06e37
           ports:
             - { containerPort: 80, name: http }
             - { containerPort: 9091, name: metrics }
@@ -71,7 +71,7 @@ spec:
             - { name: S3_SECRET_KEY, valueFrom: { secretKeyRef: { name: collab-secrets, key: S3_SECRET_KEY } } }
             - { name: S3_BUCKET, valueFrom: { secretKeyRef: { name: collab-secrets, key: S3_BUCKET } } }
           volumeMounts:
-            - { name: account-data, mountPath: /data }
+            - { name: account-data, mountPath: /data, subPath: collab-notes/app }
           readinessProbe:
             httpGet: { path: /healthz, port: 80 }
             initialDelaySeconds: 3
@@ -85,7 +85,7 @@ spec:
             limits: { cpu: "1", memory: 512Mi }
       volumes:
         - name: account-data
-          persistentVolumeClaim: { claimName: collab-accounts }
+          persistentVolumeClaim: { claimName: collab-shared }
 ---
 apiVersion: v1
 kind: Service
