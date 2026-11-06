@@ -1,6 +1,6 @@
 # Collab Notes
 
-Self-hosted collaborative Markdown editing and vault synchronization for Obsidian desktop and mobile. Plugin version: **1.0.4**. No default server, analytics, billing or E2E encryption.
+Self-hosted collaborative Markdown editing and vault synchronization for Obsidian desktop and mobile. Plugin version: **1.0.5**. No default server, analytics, billing or E2E encryption.
 
 ## Features
 
@@ -54,9 +54,9 @@ BRAT repository:
 https://github.com/delfinchiknakite-netizen/collab-notes-obsidian
 ```
 
-The manifest stays at **1.0.4** by request. Replacing assets under the same version does not reliably trigger automatic updates: use BRAT's manual reinstall/update after a release has actually been published. A local build is not a published release.
+Version **1.0.5** publishes the current vault-sync implementation under a new version so BRAT can detect the update from 1.0.4. A local build is not a published release.
 
-The release workflow can be started manually with tag `1.0.4` to rebuild and replace the assets without force-moving the Git tag. It runs the plugin and full server tests before publication.
+Pushing tag `1.0.5` starts the release workflow. It can also be started manually with that tag. It runs the plugin and full server tests before publication.
 
 For official installation, use Community Plugins once the submission has been approved.
 

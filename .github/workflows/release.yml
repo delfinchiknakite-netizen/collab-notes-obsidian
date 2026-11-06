@@ -6,7 +6,7 @@ on:
       tag:
         description: Release tag
         required: true
-        default: "1.0.4"
+        default: "1.0.5"
   push:
     tags:
       - "*"
